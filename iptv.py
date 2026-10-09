@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 APP = "KFluxTV"
-VERSION = "0.5"
+VERSION = "0.5.1"
 REPO = "KisakePro/KFluxTV"
 _ROAMING = os.getenv("APPDATA", os.path.expanduser("~"))
 DATA_DIR = os.path.join(_ROAMING, "KFluxTV")
@@ -1370,7 +1370,8 @@ class Main(QMainWindow):
         """Se connecte directement au dernier compte utilisé (ou au premier)."""
         profs = load_profiles()
         if not profs or not load_settings().get("auto_connect", True):
-            return self.open_accounts()
+            self.statusBar().showMessage("Aucun compte connecté : menu Compte, Gérer les comptes (Ctrl+P).")
+            return
         last = load_settings().get("last_profile")
         self.use_profile(next((p for p in profs if p["name"] == last), profs[0]))
 
