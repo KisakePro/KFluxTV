@@ -9,7 +9,9 @@ Lecteur de flux **Xtream Codes** pour Windows : TV en direct, films, séries, gu
 - Connexion par comptes Xtream (ou lien M3U complet), plusieurs comptes, connexion automatique au dernier compte
 - **Direct**, **Films**, **Séries** avec catégories, recherche, fiche (affiche, résumé, note)
 - Bandeau chronologique des programmes (EPG) sous la vidéo pour les chaînes en direct
-- Masquer des chaînes, films, séries ou catégories entières
+- **Favoris** (onglet dédié, clic droit ou `Ctrl+D`) pour chaînes, films et séries, rangés en **groupes** (création, renommage, glisser-déposer)
+- Masquer des chaînes, films, séries ou catégories entières ; boutons **tout développer / tout réduire**
+- **Direct différé** : pause, retour arrière et retour au direct sur les chaînes en direct
 - Mode **semi plein écran** (la vidéo remplit la fenêtre) et plein écran
 - Choix de la sortie audio
 - **Chromecast** : diffusion sur TV, avec conversion automatique (ffmpeg intégré) des flux que la Chromecast ne lit pas (ex. 1080p 50 images/s)

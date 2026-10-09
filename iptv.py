@@ -1,4 +1,5 @@
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -30,12 +31,12 @@ from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QFormLayout,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-    QCheckBox, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSlider, QSplitter,
+    QCheckBox, QInputDialog, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter,
     QTabWidget, QTextBrowser, QToolTip, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 APP = "KFluxTV"
-VERSION = "0.5.1"
+VERSION = "0.6"
 REPO = "KisakePro/KFluxTV"
 _ROAMING = os.getenv("APPDATA", os.path.expanduser("~"))
 DATA_DIR = os.path.join(_ROAMING, "KFluxTV")
@@ -49,12 +50,13 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 KIND = Qt.UserRole + 1  # "cat", "ch", "movie", "series", "season", "ep"
 KEY = Qt.UserRole + 2   # id (str)
 DATA = Qt.UserRole + 3  # dict brut renvoyé par l'API
+FAV_KIND = {"ch": "live", "movie": "vod", "series": "series"}
 SECTIONS = {
-    "live": dict(title="📺  Direct", cat="get_live_categories", lst="get_live_streams",
+    "live": dict(title="📺 Direct", cat="get_live_categories", lst="get_live_streams",
                  id="stream_id", pre="", kind="ch", tag="Chaîne"),
-    "vod": dict(title="🎬  Films", cat="get_vod_categories", lst="get_vod_streams",
+    "vod": dict(title="🎬 Films", cat="get_vod_categories", lst="get_vod_streams",
                 id="stream_id", pre="vod:", kind="movie", tag="Film"),
-    "series": dict(title="🍿  Séries", cat="get_series_categories", lst="get_series",
+    "series": dict(title="🍿 Séries", cat="get_series_categories", lst="get_series",
                    id="series_id", pre="series:", kind="series", tag="Série"),
 }
 
@@ -323,7 +325,7 @@ QLineEdit { background: #1b1d24; border: 1px solid #2c3040; border-radius: 10px;
 QLineEdit:focus { border: 1px solid #7c5cff; }
 QTabWidget::pane { border: none; margin-top: 6px; }
 QTabBar { background: transparent; }
-QTabBar::tab { background: #1b1d24; color: #8b90a0; padding: 8px 14px; margin-right: 4px; border-radius: 8px; }
+QTabBar::tab { background: #1b1d24; color: #8b90a0; padding: 8px 10px; margin-right: 3px; border-radius: 8px; }
 QTabBar::tab:selected { background: #7c5cff; color: white; font-weight: 600; }
 QTabBar::tab:hover:!selected { background: #2a2d3a; color: #e6e8ef; }
 QTreeWidget, QListWidget { background: #1b1d24; border: none; border-radius: 12px; padding: 6px; outline: 0; }
@@ -368,6 +370,13 @@ def make_pixmap(size=256):
                              QPointF(size * .75, size * .5)]))
     p.end()
     return pm
+
+
+def clean_title(t):
+    t = t.replace("  [masqué]", "")
+    while t and t[0] in "★📺🎬🍿":
+        t = t[1:].lstrip()
+    return t
 
 
 def fmt_ms(ms):
@@ -563,6 +572,33 @@ class Section:
         self.stats = (0, 0, 0)
 
 
+class FavTree(QTreeWidget):
+    """Arbre des favoris : on peut glisser des éléments sur un groupe pour les y ranger."""
+
+    def __init__(self):
+        super().__init__()
+        self.on_drop = None
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.DragDrop)
+        self.setDefaultDropAction(Qt.MoveAction)
+
+    def dropEvent(self, e):
+        target = self.itemAt(e.position().toPoint())
+        if target is None:
+            return e.ignore()
+        if target.parent() is not None:
+            target = target.parent()
+        keys = [f"{FAV_KIND[i.data(0, KIND)]}:{i.data(0, KEY)}" for i in self.selectedItems()
+                if i.data(0, KIND) in FAV_KIND]
+        group = target.data(0, KEY)
+        e.setDropAction(Qt.IgnoreAction)  # on reconstruit l'arbre nous-mêmes
+        e.ignore()
+        if keys and self.on_drop:
+            QTimer.singleShot(0, lambda: self.on_drop(keys, group))
+
+
 class VideoWidget(QVideoWidget):
     toggleSemi = Signal()
     escape = Signal()
@@ -650,6 +686,59 @@ def plan_transcode(url, mode):
     return dict(v="copy" if v_ok and mode == "auto" else "enc", h=h, a="copy" if a_ok else "enc")
 
 
+_JOB = None
+
+
+def kill_with_parent(proc):
+    """Rattache un processus enfant à un objet Job Windows : il est tué si l'application se ferme ou plante."""
+    global _JOB
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.windll.kernel32
+        k.CreateJobObjectW.restype = wintypes.HANDLE
+        k.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        if _JOB is None:
+            class BASIC(ctypes.Structure):
+                _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong), ("PerJobUserTimeLimit", ctypes.c_longlong),
+                            ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                            ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                            ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                            ("SchedulingClass", wintypes.DWORD)]
+
+            class IOC(ctypes.Structure):
+                _fields_ = [(n, ctypes.c_ulonglong) for n in (
+                    "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                    "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+            class EXT(ctypes.Structure):
+                _fields_ = [("Basic", BASIC), ("Io", IOC), ("ProcessMemoryLimit", ctypes.c_size_t),
+                            ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                            ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+            h = k.CreateJobObjectW(None, None)
+            info = EXT()
+            info.Basic.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            k.SetInformationJobObject(h, 9, ctypes.byref(info), ctypes.sizeof(info))
+            _JOB = h
+        k.AssignProcessToJobObject(_JOB, int(proc._handle))
+    except Exception:
+        pass
+
+
+def clean_stale_temp():
+    """Supprime les enregistrements temporaires laissés par un plantage précédent."""
+    base = tempfile.gettempdir()
+    try:
+        for name in os.listdir(base):
+            if name.startswith(("iptvts_", "iptvhls_")):
+                path = os.path.join(base, name)
+                if time.time() - os.path.getmtime(path) > 3600:
+                    shutil.rmtree(path, ignore_errors=True)
+    except OSError:
+        pass
+
+
 def local_ip(remote):
     """Adresse LAN du PC telle que la voit l'appareil `remote`."""
     sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -667,8 +756,13 @@ class Relay:
     def __init__(self):
         self.srv = None
         self.port = 0
+        self.srv_lan, self.lan_port = None, 0
         self.hls_proc = self.hls_dir = self.hls_id = None
         self.active = set()  # connexions amont en cours (libérées à l'arrêt)
+        self.ts_deleted = 0
+        self.rec_files = []        # enregistrement brut : [(durée en s, nom du fichier)]
+        self.rec_stop = threading.Event()
+        self.rec_resp = None
 
     def ffmpeg_cmd(self, url, v, h, a, outdir):
         cmd = [ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-fflags", "+genpts+discardcorrupt",
@@ -696,8 +790,110 @@ class Relay:
         cmd = self.ffmpeg_cmd(url, plan["v"], plan["h"], plan["a"], self.hls_dir)
         self.hls_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                          stdin=subprocess.DEVNULL, creationflags=NOWIN)
+        kill_with_parent(self.hls_proc)
+
+    def start_timeshift(self, url):
+        """Enregistre le flux MPEG-TS du fournisseur tel quel (aucune conversion : lecture identique au direct)
+        par morceaux d'environ 2 s, pour permettre pause / retour arrière."""
+        self.start()
+        self.stop_hls()
+        self.hls_dir = tempfile.mkdtemp(prefix="iptvts_")
+        self.hls_id = os.path.basename(self.hls_dir)
+        self.ts_deleted = 0
+        self.rec_files = []
+        self.rec_stop = threading.Event()
+        threading.Thread(target=self._rec_loop, args=(url, self.rec_stop, self.hls_dir, self.rec_files),
+                         daemon=True).start()
+        return f"http://127.0.0.1:{self.port}/h/{self.hls_id}"
+
+    def _rec_loop(self, url, stop, outdir, files):
+        n, fh, t0, w0, name = 0, None, None, 0.0, None
+        pcr_pid = None
+        while not stop.is_set():
+            buf, synced = b"", False
+            try:
+                r = requests.get(url, headers=HEADERS, stream=True, timeout=15)
+                r.raise_for_status()
+                self.rec_resp = r
+                for chunk in r.iter_content(65536):
+                    if stop.is_set():
+                        break
+                    buf += chunk
+                    if not synced:  # recale sur les paquets de 188 octets (octet de synchro 0x47)
+                        o = next((i for i in range(min(188, len(buf) - 376))
+                                  if buf[i] == 0x47 and buf[i + 188] == 0x47 and buf[i + 376] == 0x47), None)
+                        if o is None:
+                            buf = buf[-376:] if len(buf) > 376 else buf
+                            continue
+                        buf, synced = buf[o:], True
+                    k = len(buf) // 188 * 188
+                    data, buf = buf[:k], buf[k:]
+                    pcr = None
+                    for off in range(0, k, 188):  # horloge du flux (PCR) : durée exacte de chaque morceau
+                        if data[off + 3] & 0x20 and data[off + 4] >= 7 and data[off + 5] & 0x10:
+                            pid = ((data[off + 1] & 0x1F) << 8) | data[off + 2]
+                            if pcr_pid is None:
+                                pcr_pid = pid
+                            if pid == pcr_pid:
+                                x = data[off + 6:off + 11]
+                                pcr = ((x[0] << 25) | (x[1] << 17) | (x[2] << 9) | (x[3] << 1) | (x[4] >> 7)) / 90.0
+                                break
+                    now = time.time()
+                    if fh is not None:
+                        span = (pcr - t0) if (pcr is not None and t0 is not None) else (now - w0) * 1000
+                        if span >= 2000 or span < 0:
+                            if not (0 < span < 20000):
+                                span = (now - w0) * 1000
+                            fh.close()
+                            files.append((span / 1000.0, name))
+                            fh = None
+                    if fh is None:
+                        name = f"r{n:06d}.ts"
+                        n += 1
+                        fh = open(os.path.join(outdir, name), "wb")
+                        t0, w0 = pcr, now
+                    elif t0 is None and pcr is not None:
+                        t0 = pcr
+                    fh.write(data)
+            except Exception:
+                pass
+            finally:
+                self.rec_resp = None
+            if fh is not None:  # connexion coupée : on ferme le morceau en cours
+                try:
+                    fh.close()
+                    files.append((max(0.1, time.time() - w0), name))
+                except Exception:
+                    pass
+                fh, t0 = None, None
+            if not stop.is_set():
+                time.sleep(1)
+
+    def ts_segments(self):
+        return list(self.rec_files)
+
+    def ts_trim(self, keep_from_ms):
+        """Supprime du disque les segments plus anciens que la fenêtre de retour arrière."""
+        t = 0.0
+        for i, (d, name) in enumerate(self.ts_segments()):
+            if (t + d) * 1000 >= keep_from_ms - 15000:
+                break
+            if i >= self.ts_deleted and self.hls_dir:
+                try:
+                    os.remove(os.path.join(self.hls_dir, name))
+                except OSError:
+                    pass
+                self.ts_deleted = i + 1
+            t += d
 
     def stop_hls(self):
+        self.rec_stop.set()
+        r = self.rec_resp
+        if r is not None:
+            try:
+                r.close()
+            except Exception:
+                pass
         if self.hls_proc:
             try:
                 self.hls_proc.kill()
@@ -707,6 +903,7 @@ class Relay:
         if self.hls_dir:
             shutil.rmtree(self.hls_dir, ignore_errors=True)
         self.hls_proc, self.hls_dir, self.hls_id = None, None, None
+        self.rec_files = []
 
     def stop_all(self):
         self.stop_hls()
@@ -745,7 +942,32 @@ class Relay:
             def do_GET(self):
                 self.serve()
 
-            def serve_hls(self, name, head):
+            def serve_hls(self, name, head, q):
+                if name == "c.ts":  # flux MPEG-TS continu : les segments enregistrés mis bout à bout
+                    idx = int(q.get("s", ["0"])[0])
+                    sid = relay.hls_id
+                    self.send_response(200)
+                    self.cors()
+                    self.send_header("Content-Type", "video/mp2t")
+                    self.end_headers()
+                    if head:
+                        return
+                    while relay.hls_id == sid and relay.hls_dir:
+                        segs = relay.ts_segments()
+                        if idx >= len(segs):
+                            time.sleep(0.1)
+                            continue
+                        try:
+                            with open(os.path.join(relay.hls_dir, segs[idx][1]), "rb") as fh:
+                                while True:
+                                    b = fh.read(262144)
+                                    if not b:
+                                        break
+                                    self.wfile.write(b)
+                        except FileNotFoundError:
+                            pass  # segment supprimé (hors fenêtre) : on passe au suivant
+                        idx += 1
+                    return
                 f = os.path.join(relay.hls_dir or "", os.path.basename(name))
                 if name.endswith(".m3u8"):  # attendre le 1er segment
                     for _ in range(80):
@@ -770,13 +992,20 @@ class Relay:
                     self.wfile.write(body)
 
             def serve(self, head=False):
+                try:
+                    if not ipaddress.ip_address(self.client_address[0]).is_private:
+                        self.send_response(403)
+                        self.end_headers()
+                        return
+                except ValueError:
+                    return
                 path = urlparse(self.path).path
                 q = parse_qs(urlparse(self.path).query)
                 if path.startswith("/h/"):
                     parts = path.split("/")
                     if len(parts) == 4 and parts[2] == relay.hls_id:
                         try:
-                            return self.serve_hls(parts[3], head)
+                            return self.serve_hls(parts[3], head, q)
                         except (BrokenPipeError, ConnectionError, OSError):
                             return
                     self.send_response(404)
@@ -832,10 +1061,20 @@ class Relay:
                         relay.active.discard(r)
                         r.close()
 
-        self.srv = ThreadingHTTPServer(("0.0.0.0", 0), H)
+        self._handler = H
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)  # lecture locale : pas d'ouverture réseau
         self.srv.daemon_threads = True
         self.port = self.srv.server_address[1]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def start_lan(self):
+        """Serveur accessible depuis le réseau local, créé seulement pour la diffusion Chromecast."""
+        self.start()
+        if self.srv_lan is None:
+            self.srv_lan = ThreadingHTTPServer(("0.0.0.0", 0), self._handler)
+            self.srv_lan.daemon_threads = True
+            self.lan_port = self.srv_lan.server_address[1]
+            threading.Thread(target=self.srv_lan.serve_forever, daemon=True).start()
 
     @staticmethod
     def wrap(url, host):
@@ -855,13 +1094,13 @@ class Relay:
         return "\n".join(out) + "\n"
 
     def transcode_url(self, url, remote_host, plan):
-        self.start()
+        self.start_lan()
         self.start_hls(url, plan)
-        return f"http://{local_ip(remote_host)}:{self.port}/h/{self.hls_id}/index.m3u8"
+        return f"http://{local_ip(remote_host)}:{self.lan_port}/h/{self.hls_id}/index.m3u8"
 
     def url_for(self, url, remote_host):
-        self.start()
-        return f"http://{local_ip(remote_host)}:{self.port}/r?u={quote(url, safe='')}"
+        self.start_lan()
+        return f"http://{local_ip(remote_host)}:{self.lan_port}/r?u={quote(url, safe='')}"
 
 
 # ---------- mises à jour (GitHub Releases) ----------
@@ -1048,6 +1287,28 @@ class OptionsDialog(QDialog):
         self.c_auto.setChecked(st.get("auto_connect", True))
         self.c_upd = QCheckBox("Rechercher les mises à jour au démarrage")
         self.c_upd.setChecked(st.get("auto_update", True))
+        self.c_ts = QCheckBox("Direct différé : pause et retour arrière sur les chaînes en direct")
+        self.c_ts.setChecked(st.get("timeshift", True))
+        self.sp_ts = QSpinBox()
+        self.sp_ts.setRange(5, 240)
+        self.sp_ts.setSuffix(" min")
+        self.sp_ts.setValue(int(st.get("ts_minutes", 60)))
+        self.sp_margin = QSpinBox()
+        self.sp_margin.setRange(3, 60)
+        self.sp_margin.setSuffix(" s")
+        self.sp_margin.setValue(int(st.get("ts_margin", 20)))
+        self.sp_margin.setToolTip("Retard gardé sur le direct. Plus il est grand, moins il y a de saccades "
+                                  "quand le fournisseur envoie les images par à-coups.")
+        row_mg = QHBoxLayout()
+        row_mg.addSpacing(24)
+        row_mg.addWidget(QLabel("Délai de sécurité anti-saccades"))
+        row_mg.addWidget(self.sp_margin)
+        row_mg.addStretch()
+        row_ts = QHBoxLayout()
+        row_ts.addSpacing(24)
+        row_ts.addWidget(QLabel("Retour arrière possible sur"))
+        row_ts.addWidget(self.sp_ts)
+        row_ts.addStretch()
         b_upd = QPushButton("🔄  Mises à jour…")
         b_upd.clicked.connect(lambda: UpdateDialog(self).exec())
         b_dir = QPushButton("📁  Ouvrir le dossier des données")
@@ -1064,6 +1325,9 @@ class OptionsDialog(QDialog):
         lay.addWidget(about)
         lay.addWidget(self.c_auto)
         lay.addWidget(self.c_upd)
+        lay.addWidget(self.c_ts)
+        lay.addLayout(row_ts)
+        lay.addLayout(row_mg)
         lay.addWidget(b_upd)
         lay.addWidget(b_dir)
         lay.addWidget(bb)
@@ -1072,6 +1336,9 @@ class OptionsDialog(QDialog):
         st = load_settings()
         st["auto_connect"] = self.c_auto.isChecked()
         st["auto_update"] = self.c_upd.isChecked()
+        st["timeshift"] = self.c_ts.isChecked()
+        st["ts_minutes"] = self.sp_ts.value()
+        st["ts_margin"] = self.sp_margin.value()
         save_settings(st)
         self.accept()
 
@@ -1095,6 +1362,8 @@ class Main(QMainWindow):
         self.profile = None
         self.semi = False
         self.cands, self.cand_i = [], 0
+        self.local_cands = []
+        self.fav_total, self.fav_missing = 0, False
         self.hc, self.hh = set(), set()  # clés masquées (préfixées par section)
         self.jobs = set()
         self.img_cache = {}
@@ -1104,11 +1373,26 @@ class Main(QMainWindow):
         self.cast = None          # Chromecast connecté (None = lecture locale)
         self.cast_devs = {}
         self.relay = Relay()
+        clean_stale_temp()
         self.zc = None
         self.cast_menu = QMenu("&Diffusion", self)
         self.cast_event.connect(self.on_cast_event)
         self.cast_timer = QTimer(self)
         self.cast_timer.timeout.connect(self.cast_tick)
+        self.favs = set()         # favoris : "live:ID", "vod:ID", "series:ID"
+        self.fav_groups = []      # groupes de favoris (ordre de création)
+        self.fav_group_of = {}    # clé favori -> nom du groupe ("" = non classé)
+        self.ts_active = False    # lecture locale via l'enregistrement tampon (direct différé)
+        self.ts_failed = False
+        self.ts_window_ms = 3600000
+        self.ts_margin = 20000     # retard gardé sur le direct pour absorber les à-coups du fournisseur
+        self.ts_url, self.ts_pending, self.ts_last = "", None, 0
+        self.ts_base = 0           # instant d'enregistrement où le lecteur a (ré)ouvert la liste
+        self.ts_autolive = False
+        self.ts_hist = []
+        self.ts_live, self.ts_live_shown, self.ts_rng = True, None, None
+        self.ts_timer = QTimer(self)
+        self.ts_timer.timeout.connect(self.ts_tick)
 
         # ----- panneau gauche -----
         self.search = QLineEdit()
@@ -1124,6 +1408,20 @@ class Main(QMainWindow):
             self.sec[key] = sec
             self.tree_sec[tree] = sec
             self.tabs.addTab(tree, sec.title)
+        self.fav_tree = self.make_tree(FavTree)
+        self.fav_tree.on_drop = self.drop_on_group
+        page = QWidget()
+        pl = QVBoxLayout(page)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(6)
+        b_grp = QPushButton("＋  Nouveau groupe")
+        b_grp.setToolTip("Créer un groupe pour ranger tes favoris (glisse-dépose ensuite)")
+        b_grp.clicked.connect(self.new_group_dialog)
+        pl.addWidget(b_grp)
+        pl.addWidget(self.fav_tree, 1)
+        self.tabs.addTab(page, "⭐ Favoris")
+        self.tabs.tabBar().setUsesScrollButtons(False)
+        self.tabs.tabBar().setExpanding(True)
         self.tabs.currentChanged.connect(self.on_tab)
 
         self.card = QWidget()
@@ -1158,7 +1456,19 @@ class Main(QMainWindow):
         ll = QVBoxLayout(self.left)
         ll.setContentsMargins(10, 4, 4, 4)
         ll.setSpacing(8)
-        ll.addWidget(self.search)
+        b_exp = QPushButton("⊞")
+        b_exp.setObjectName("round")
+        b_exp.setToolTip("Tout développer (Ctrl+E)")
+        b_exp.clicked.connect(self.expand_all)
+        b_col = QPushButton("⊟")
+        b_col.setObjectName("round")
+        b_col.setToolTip("Tout réduire (Ctrl+Maj+E)")
+        b_col.clicked.connect(self.collapse_all)
+        srow = QHBoxLayout()
+        srow.addWidget(self.search, 1)
+        srow.addWidget(b_exp)
+        srow.addWidget(b_col)
+        ll.addLayout(srow)
         ll.addWidget(self.tabs, 1)
         ll.addWidget(self.card)
         ll.addWidget(self.count)
@@ -1194,14 +1504,18 @@ class Main(QMainWindow):
         self.t_end = QLabel("")
         self.t_cur.setObjectName("muted")
         self.t_end.setObjectName("muted")
+        self.t_cur.setMinimumWidth(56)
+        self.t_end.setMinimumWidth(120)
         self.vol = QSlider(Qt.Horizontal)
         self.vol.setRange(0, 100)
         self.vol.setValue(70)
         self.vol.setMaximumWidth(120)
         self.vol.valueChanged.connect(self.set_volume)
-        b_semi = QPushButton("⛶  Semi plein écran")
+        b_semi = QPushButton("⛶  Semi")
+        b_semi.setToolTip("Semi plein écran : la vidéo remplit la fenêtre (F)")
         b_semi.clicked.connect(self.toggle_semi)
-        b_fs = QPushButton("⤢  Plein écran")
+        b_fs = QPushButton("⤢  Plein")
+        b_fs.setToolTip("Plein écran (F11)")
         b_fs.clicked.connect(lambda: self.video.setFullScreen(True))
 
         self.barw = QWidget()
@@ -1218,6 +1532,20 @@ class Main(QMainWindow):
         r2 = QHBoxLayout()
         r2.addWidget(self.b_play)
         r2.addWidget(b_stop)
+        b_back = QPushButton("↺ 10")
+        b_back.setToolTip("Reculer de 10 secondes (Ctrl+←)")
+        b_back.clicked.connect(lambda: self.skip(-10000))
+        b_fwd = QPushButton("10 ↻")
+        b_fwd.setToolTip("Avancer de 10 secondes (Ctrl+→)")
+        b_fwd.clicked.connect(lambda: self.skip(10000))
+        self.b_live = QPushButton("● DIRECT")
+        self.b_live.setToolTip("Revenir au direct (Ctrl+L)")
+        self.b_live.clicked.connect(self.go_live)
+        self.b_live.setVisible(False)
+        self.b_live.setFixedWidth(160)
+        r2.addWidget(b_back)
+        r2.addWidget(b_fwd)
+        r2.addWidget(self.b_live)
         r2.addSpacing(8)
         r2.addWidget(self.title, 1)
         r2.addWidget(QLabel("🔊"))
@@ -1240,7 +1568,7 @@ class Main(QMainWindow):
         sp = QSplitter()
         sp.addWidget(self.left)
         sp.addWidget(right)
-        sp.setSizes([400, 880])
+        sp.setSizes([440, 840])
         sp.setStretchFactor(1, 1)
         self.setCentralWidget(sp)
 
@@ -1254,8 +1582,8 @@ class Main(QMainWindow):
         if load_settings().get("auto_update", True) and getattr(sys, "frozen", False):
             QTimer.singleShot(5000, self.startup_update_check)
 
-    def make_tree(self):
-        t = QTreeWidget()
+    def make_tree(self, cls=QTreeWidget):
+        t = cls()
         t.setHeaderHidden(True)
         t.setIndentation(16)
         t.setUniformRowHeights(True)
@@ -1269,7 +1597,12 @@ class Main(QMainWindow):
         return t
 
     def cur_sec(self):
-        return self.sec[list(SECTIONS)[self.tabs.currentIndex()]]
+        """Section de l'onglet affiché (None pour l'onglet Favoris)."""
+        i = self.tabs.currentIndex()
+        return self.sec[list(SECTIONS)[i]] if i < len(SECTIONS) else None
+
+    def cur_tree(self):
+        return self.fav_tree if self.tabs.currentIndex() >= len(SECTIONS) else self.tabs.currentWidget()
 
     def run_job(self, fn, ok, err=None):
         j = Job(fn)
@@ -1302,8 +1635,13 @@ class Main(QMainWindow):
         m = mb.addMenu("C&ontenu")
         self.act_show = self.act(m, "Afficher les éléments masqués", lambda: self.build_tree(), checkable=True)
         self.act(m, "Gérer les éléments masqués…", self.manage_hidden)
+        m.addSeparator()
+        self.act(m, "Ajouter / retirer des favoris", self.toggle_fav_selected, "Ctrl+D")
+        self.act(m, "Tout développer", self.expand_all, "Ctrl+E")
+        self.act(m, "Tout réduire", self.collapse_all, "Ctrl+Shift+E")
         m = mb.addMenu("&Lecture")
         self.act(m, "Lecture / Pause", self.toggle_play, "Space")
+        self.act(m, "Revenir au direct", self.go_live, "Ctrl+L")
         self.act(m, "Avancer de 10 s", lambda: self.skip(10000), "Ctrl+Right")
         self.act(m, "Reculer de 10 s", lambda: self.skip(-10000), "Ctrl+Left")
         self.audio_menu = mb.addMenu("A&udio")
@@ -1387,6 +1725,9 @@ class Main(QMainWindow):
         self.profile = p
         self.hc = set(p.get("hidden_cats", []))
         self.hh = set(p.get("hidden_chs", []))
+        self.favs = set(p.get("favs", []))
+        self.fav_groups = list(p.get("fav_groups", []))
+        self.fav_group_of = dict(p.get("fav_group_of", {}))
         st = load_settings()
         st["last_profile"] = p["name"]
         save_settings(st)
@@ -1417,6 +1758,8 @@ class Main(QMainWindow):
             s.tree.clear()
         self.series_loading.clear()
         self.info_cache.clear()
+        self.fav_tree.clear()
+        self.fav_total, self.fav_missing = 0, False
         self.show_card(None)
 
     def account_info(self):
@@ -1450,16 +1793,24 @@ class Main(QMainWindow):
             return self.open_accounts()
         self.clear_sections()
         self.load_section("live")
-        if self.cur_sec().key != "live":
-            self.load_section(self.cur_sec().key)
+        cs = self.cur_sec()
+        if cs is None:
+            self.ensure_fav_sections()
+        elif cs.key != "live":
+            self.load_section(cs.key)
 
     def on_tab(self, _):
         sec = self.cur_sec()
-        if self.profile and not sec.loaded and not sec.loading:
-            self.load_section(sec.key)
+        if sec is None:
+            self.ensure_fav_sections()
+            self.build_favs()
+        else:
+            if self.profile and not sec.loaded and not sec.loading:
+                self.load_section(sec.key)
+            self.refresh_stars(sec)
         self.filter()
         self.update_count()
-        self.show_card(sec.tree.currentItem())
+        self.show_card(self.cur_tree().currentItem())
 
     def load_section(self, key):
         sec, p = self.sec[key], self.profile
@@ -1495,8 +1846,24 @@ class Main(QMainWindow):
         for k, sec in self.sec.items():
             if (key is None or k == key) and sec.loaded:
                 self.fill_tree(sec)
+        self.build_favs()
         self.filter()
         self.update_count()
+
+    def item_text(self, sec, s, star=True):
+        sid = str(s.get(sec.id))
+        t = ("★ " if star and f"{sec.key}:{sid}" in self.favs else "") + (s.get("name") or "?")
+        return t + ("  [masqué]" if (sec.pre + sid) in self.hh else "")
+
+    def new_item(self, parent, sec, s, star=True, icon=""):
+        sid = str(s.get(sec.id))
+        it = QTreeWidgetItem(parent, [(icon + " " if icon else "") + self.item_text(sec, s, star)])
+        it.setData(0, KIND, sec.kind)
+        it.setData(0, KEY, sid)
+        it.setData(0, DATA, s)
+        if sec.kind == "series":
+            it.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+        return it
 
     def fill_tree(self, sec):
         show = self.act_show.isChecked()
@@ -1529,23 +1896,18 @@ class Main(QMainWindow):
                 top.setForeground(0, grey)
             ncat += 1
             for s in kids:
-                sid = str(s.get(sec.id))
-                it = QTreeWidgetItem(top, [s.get("name") or "?"])
-                it.setData(0, KIND, sec.kind)
-                it.setData(0, KEY, sid)
-                it.setData(0, DATA, s)
-                if sec.kind == "series":
-                    it.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
-                if cat_hidden or (pre + sid) in self.hh:
+                it = self.new_item(top, sec, s)
+                if cat_hidden or (pre + str(s.get(sec.id))) in self.hh:
                     it.setForeground(0, grey)
-                    if (pre + sid) in self.hh:
-                        it.setText(0, it.text(0) + "  [masqué]")
                 nitem += 1
         sec.stats = (ncat, nitem, nhid)
         tree.setUpdatesEnabled(True)
 
     def update_count(self):
         sec = self.cur_sec()
+        if sec is None:
+            self.count.setText(f"{self.fav_total} favoris" + (" · chargement…" if self.fav_missing else ""))
+            return
         if not sec.loaded:
             self.count.setText("Chargement…" if sec.loading else "")
             return
@@ -1554,7 +1916,7 @@ class Main(QMainWindow):
 
     def filter(self):
         t = self.search.text().lower().strip()
-        tree = self.cur_sec().tree
+        tree = self.cur_tree()
         for i in range(tree.topLevelItemCount()):
             cat = tree.topLevelItem(i)
             vis = 0
@@ -1563,7 +1925,7 @@ class Main(QMainWindow):
                 show = not t or t in c.text(0).lower()
                 c.setHidden(not show)
                 vis += show
-            cat.setHidden(vis == 0)
+            cat.setHidden(bool(t) and vis == 0)
             if t and vis:
                 cat.setExpanded(True)
 
@@ -1639,15 +2001,238 @@ class Main(QMainWindow):
         self.build_tree(sec.key)
 
     def tree_menu(self, tree, pos):
-        sec = self.tree_sec[tree]
-        items = [i for i in tree.selectedItems() if i.data(0, KIND) in self.HIDEABLE]
-        if not items:
-            return
-        all_hidden = all(self.is_hidden(sec, i) for i in items)
+        isfav = tree is self.fav_tree
+        sel = tree.selectedItems()
+        items = [i for i in sel if i.data(0, KIND) in FAV_KIND]
+        groups = [i for i in sel if i.data(0, KIND) == "group"]
         m = QMenu(self)
-        a = m.addAction("Réafficher" if all_hidden else "Masquer")
-        if m.exec(tree.viewport().mapToGlobal(pos)) == a:
-            self.set_hidden(sec, items, not all_hidden)
+        acts = {}
+
+        def add(menu, text, fn):
+            a = menu.addAction(text)
+            acts[a] = fn
+            return a
+
+        if isfav:
+            if items:
+                sub = m.addMenu("📁  Déplacer vers")
+                add(sub, "⭐  Non classés", lambda: self.move_to_group(items, ""))
+                for g in self.fav_groups:
+                    add(sub, f"📁  {g}", lambda g=g: self.move_to_group(items, g))
+                sub.addSeparator()
+                add(sub, "＋  Nouveau groupe…", lambda: self.move_to_new_group(items))
+                add(m, "☆  Retirer des favoris", lambda: self.set_fav(items, False))
+            if len(groups) == 1 and groups[0].data(0, KEY):
+                g = groups[0].data(0, KEY)
+                add(m, "✏  Renommer le groupe…", lambda: self.rename_group(g))
+                add(m, "🗑  Supprimer le groupe", lambda: self.delete_group(g))
+            if m.actions():
+                m.addSeparator()
+            add(m, "＋  Nouveau groupe…", self.new_group_dialog)
+        else:
+            hide_items = [i for i in sel if i.data(0, KIND) in self.HIDEABLE]
+            if not items and not hide_items:
+                return
+            if items:
+                if all(self.fav_key(i) in self.favs for i in items):
+                    add(m, "☆  Retirer des favoris", lambda: self.set_fav(items, False))
+                else:
+                    add(m, "⭐  Ajouter aux favoris", lambda: self.set_fav(items, True, ""))
+                    sub = m.addMenu("📁  Ajouter au groupe")
+                    for g in self.fav_groups:
+                        add(sub, f"📁  {g}", lambda g=g: self.set_fav(items, True, g))
+                    if self.fav_groups:
+                        sub.addSeparator()
+                    add(sub, "＋  Nouveau groupe…", lambda: self.add_to_new_group(items))
+            if hide_items:
+                sec = self.tree_sec[tree]
+                all_hidden = all(self.is_hidden(sec, i) for i in hide_items)
+                add(m, "Réafficher" if all_hidden else "Masquer",
+                    lambda: self.set_hidden(sec, hide_items, not all_hidden))
+        r = m.exec(tree.viewport().mapToGlobal(pos))
+        if r in acts:
+            acts[r]()
+
+    # ---------- favoris ----------
+    def fav_key(self, it):
+        return f"{FAV_KIND[it.data(0, KIND)]}:{it.data(0, KEY)}"
+
+    def save_favs(self):
+        if not self.profile:
+            return
+        profs = load_profiles()
+        for p in profs:
+            if p["name"] == self.profile["name"]:
+                p["favs"] = sorted(self.favs)
+                p["fav_groups"] = list(self.fav_groups)
+                p["fav_group_of"] = {k: g for k, g in self.fav_group_of.items() if k in self.favs and g}
+        save_profiles(profs)
+
+    def group_of(self, key):
+        g = self.fav_group_of.get(key, "")
+        return g if g in self.fav_groups else ""
+
+    def set_fav(self, items, add, group=None):
+        for it in items:
+            k = self.fav_key(it)
+            if add:
+                self.favs.add(k)
+                if group is not None:
+                    self.fav_group_of[k] = group
+            else:
+                self.favs.discard(k)
+                self.fav_group_of.pop(k, None)
+        self.after_fav_change()
+        self.statusBar().showMessage("Ajouté aux favoris." if add else "Retiré des favoris.")
+
+    def after_fav_change(self):
+        self.save_favs()
+        sec = self.cur_sec()
+        if sec:
+            self.refresh_stars(sec)
+        self.build_favs()
+        self.update_count()
+
+    def toggle_fav_selected(self):
+        items = [i for i in self.cur_tree().selectedItems() if i.data(0, KIND) in FAV_KIND]
+        if not items:
+            return self.statusBar().showMessage("Sélectionne une chaîne, un film ou une série.")
+        self.set_fav(items, not all(self.fav_key(i) in self.favs for i in items), "")
+
+    def new_group(self):
+        """Demande un nom et crée le groupe ; renvoie le nom (ou None)."""
+        name, ok = QInputDialog.getText(self, "Nouveau groupe", "Nom du groupe de favoris :")
+        name = name.strip()
+        if not ok or not name:
+            return None
+        if name in self.fav_groups:
+            self.statusBar().showMessage(f"Le groupe « {name} » existe déjà.")
+            return name
+        self.fav_groups.append(name)
+        self.save_favs()
+        return name  # l'arbre est reconstruit par l'appelant (les éléments sélectionnés restent valides)
+
+    def new_group_dialog(self):
+        if self.new_group() is not None:
+            self.build_favs()
+
+    def add_to_new_group(self, items):
+        g = self.new_group()
+        if g is not None:
+            self.set_fav(items, True, g)
+
+    def move_to_new_group(self, items):
+        g = self.new_group()
+        if g is not None:
+            self.move_to_group(items, g)
+
+    def move_to_group(self, items, group):
+        for it in items:
+            k = self.fav_key(it)
+            if group:
+                self.fav_group_of[k] = group
+            else:
+                self.fav_group_of.pop(k, None)
+        self.after_fav_change()
+
+    def drop_on_group(self, keys, group):
+        for k in keys:
+            if group:
+                self.fav_group_of[k] = group
+            else:
+                self.fav_group_of.pop(k, None)
+        self.after_fav_change()
+
+    def rename_group(self, old):
+        name, ok = QInputDialog.getText(self, "Renommer le groupe", "Nouveau nom :", text=old)
+        name = name.strip()
+        if not ok or not name or name == old:
+            return
+        if name in self.fav_groups:
+            return self.statusBar().showMessage(f"Le groupe « {name} » existe déjà.")
+        self.fav_groups[self.fav_groups.index(old)] = name
+        self.fav_group_of = {k: (name if g == old else g) for k, g in self.fav_group_of.items()}
+        self.after_fav_change()
+
+    def delete_group(self, g):
+        if QMessageBox.question(self, APP, f"Supprimer le groupe « {g} » ?\n"
+                                           "Ses favoris sont conservés dans « Non classés ».") != QMessageBox.Yes:
+            return
+        self.fav_groups.remove(g)
+        self.fav_group_of = {k: v for k, v in self.fav_group_of.items() if v != g}
+        self.after_fav_change()
+
+    def refresh_stars(self, sec):
+        """Remet à jour l'étoile ★ devant les éléments de la liste affichée."""
+        t = sec.tree
+        t.setUpdatesEnabled(False)
+        for i in range(t.topLevelItemCount()):
+            top = t.topLevelItem(i)
+            for j in range(top.childCount()):
+                c = top.child(j)
+                d = c.data(0, DATA)
+                if d:
+                    txt = self.item_text(sec, d)
+                    if c.text(0) != txt:
+                        c.setText(0, txt)
+        t.setUpdatesEnabled(True)
+
+    def ensure_fav_sections(self):
+        for key in SECTIONS:
+            sec = self.sec[key]
+            if self.profile and not sec.loaded and not sec.loading and any(
+                    k.startswith(key + ":") for k in self.favs):
+                self.load_section(key)
+
+    def build_favs(self):
+        t = self.fav_tree
+        opened = {t.topLevelItem(i).data(0, KEY): t.topLevelItem(i).isExpanded()
+                  for i in range(t.topLevelItemCount())}
+        t.setUpdatesEnabled(False)
+        t.clear()
+        self.fav_total, self.fav_missing = 0, False
+        by = {g: [] for g in self.fav_groups}
+        by[""] = []
+        icons = {"live": "📺", "vod": "🎬", "series": "🍿"}
+        for key in ("live", "vod", "series"):
+            ids = {k.split(":", 1)[1] for k in self.favs if k.startswith(key + ":")}
+            if not ids:
+                continue
+            sec = self.sec[key]
+            if not sec.loaded:
+                self.fav_missing = True
+                continue
+            for x in sec.items:
+                sid = str(x.get(sec.id))
+                if sid in ids:
+                    by[self.group_of(f"{key}:{sid}")].append((sec, x))
+        for g in self.fav_groups + [""]:
+            items = sorted(by[g], key=lambda sx: (sx[1].get("name") or "").lower())
+            if not g and not items:
+                continue
+            title = f"📁  {g}" if g else "⭐  Non classés"
+            top = QTreeWidgetItem(t, [f"{title}  ({len(items)})"])
+            top.setData(0, KIND, "group")
+            top.setData(0, KEY, g)
+            for sec, x in items:
+                self.new_item(top, sec, x, star=False, icon=icons[sec.key])
+            self.fav_total += len(items)
+            top.setExpanded(opened.get(g, True))
+        t.setUpdatesEnabled(True)
+        if self.tabs.currentIndex() == len(SECTIONS):
+            self.filter()
+
+    def expand_all(self):
+        t = self.cur_tree()
+        t.setUpdatesEnabled(False)
+        for i in range(t.topLevelItemCount()):
+            it = t.topLevelItem(i)
+            if not it.isHidden():
+                it.setExpanded(True)  # catégories seulement (les séries restent repliées)
+        t.setUpdatesEnabled(True)
+
+    def collapse_all(self):
+        self.cur_tree().collapseAll()
 
     def manage_hidden(self):
         names, cn = {}, {}
@@ -1681,7 +2266,7 @@ class Main(QMainWindow):
             self.card_title.setText(it.text(0))
             return
         info = d.get("info") if kind == "ep" and isinstance(d.get("info"), dict) else d
-        title = it.text(0).replace("  [masqué]", "")
+        title = clean_title(it.text(0))
         sub, plot = [], ""
         if kind == "ch":
             sub.append("Chaîne en direct")
@@ -1837,6 +2422,7 @@ class Main(QMainWindow):
             if old is not None:
                 self.cast_release(old)
             self.player.stop()
+            self.end_timeshift()
             self.cast = c
             c.media_controller.register_status_listener(CastListener(self.cast_event))
             try:
@@ -1988,7 +2574,8 @@ class Main(QMainWindow):
             name = f"{serie} — {item.text(0)}" if serie else item.text(0)
         else:
             return
-        self.title.setText(name.replace("  [masqué]", ""))
+        self.title.setText(clean_title(name))
+        self.ts_failed = False
         self.epg_tok += 1
         self.epg.setVisible(kind == "ch")
         if kind == "ch":
@@ -2026,11 +2613,132 @@ class Main(QMainWindow):
     def start(self):
         if self.cast:
             return self.cast_play()
-        self.player.setSource(QUrl(self.cands[self.cand_i]))
+        st = load_settings()
+        url0 = self.cands[0]
+        if "/live/" in url0 and st.get("timeshift", True) and not self.ts_failed:
+            src = url0[:-5] + ".ts" if url0.endswith(".m3u8") else url0
+            self.ts_window_ms = int(st.get("ts_minutes", 60)) * 60000
+            self.ts_margin = int(st.get("ts_margin", 20)) * 1000
+            self.ts_url, self.ts_pending = self.relay.start_timeshift(src), None
+            self.ts_base = 0
+            self.ts_autolive = True
+            self.ts_hist = []
+            self.ts_live, self.ts_live_shown, self.ts_rng = True, None, None
+            self.ts_active = True
+            self.b_live.setVisible(True)
+            self.seek.setEnabled(False)
+            self.ts_timer.start(1000)
+            self.ts_open(0)
+            return
+        self.end_timeshift()
+        cands = self.cands
+        if "/live/" in cands[0]:  # le flux .ts brut est bien plus régulier que la playlist .m3u8
+            ts = cands[0][:-5] + ".ts" if cands[0].endswith(".m3u8") else cands[0]
+            cands = [ts, ts[:-3] + ".m3u8"]
+        self.local_cands = cands
+        self.player.setSource(QUrl(cands[min(self.cand_i, len(cands) - 1)]))
         self.player.play()
 
+    def end_timeshift(self):
+        was = self.ts_active
+        self.ts_active = False
+        self.ts_timer.stop()
+        self.b_live.setVisible(False)
+        if was:
+            self.relay.stop_hls()
+            self.on_dur(0)
+
+    def rec_pos(self):
+        """Position dans l'enregistrement (la position du lecteur est relative au point d'ouverture)."""
+        return self.ts_base + self.player.position()
+
+    def ts_open(self, ms):
+        """(Ré)ouvre la lecture sur l'enregistrement à partir de ms : liste qui commence au bon segment."""
+        t, idx, base = 0.0, 0, 0
+        for i, (d, _) in enumerate(self.relay.ts_segments()):
+            idx, base = i, int(t * 1000)
+            if (t + d) * 1000 > ms:
+                break
+            t += d
+        self.ts_base = base
+        self.ts_last = ms
+        self.player.setSource(QUrl(f"{self.ts_url}/c.ts?s={idx}"))
+        self.player.play()
+
+    def ts_bounds(self):
+        rec = int(sum(d for d, _ in self.relay.ts_segments()) * 1000)
+        return max(0, rec - self.ts_window_ms), rec
+
+    def ts_tick(self):
+        if not self.ts_active:
+            return
+        segs = self.relay.ts_segments()
+        hi = int(sum(d for d, _ in segs) * 1000)
+        if hi <= 0:
+            return
+        lo = max(0, hi - self.ts_window_ms)
+        self.relay.ts_trim(lo)
+        self.ts_hist.append(hi)
+        if self.ts_autolive:
+            # le fournisseur envoie d'abord un arriéré (le tampon grossit bien plus vite que le temps réel) ;
+            # une fois le débit revenu à la normale, on saute au vrai direct
+            n = len(self.ts_hist)
+            if (n >= 6 and hi - self.ts_hist[-5] <= 8000) or n >= 25:
+                self.ts_autolive = False
+                return self.ts_seek(hi - self.ts_margin)
+        pos = self.rec_pos()
+        if pos < lo - 1500 and self.player.playbackState() != QMediaPlayer.StoppedState:
+            self.ts_seek(lo + 2000)  # on a dépassé la fenêtre conservée
+            pos = lo + 2000
+        if self.ts_rng != (lo, hi):
+            self.ts_rng = (lo, hi)
+            self.seek.setRange(lo, hi)
+        if not self.seek.isEnabled():
+            self.seek.setEnabled(True)
+        if not self.seek.isSliderDown():
+            self.seek.setValue(max(lo, min(pos, hi)))
+        behind = max(0, hi - pos)
+        # hystérésis : le segment le plus récent n'arrive que toutes les ~2 s, sans seuil double
+        # l'état « direct / en retard » basculerait en permanence
+        if self.ts_live and behind > self.ts_margin + 18000:
+            self.ts_live = False
+        elif not self.ts_live and behind < self.ts_margin + 10000:
+            self.ts_live = True
+        self.set_ts_label(self.t_cur, "" if self.ts_live else f"-{fmt_ms(behind // 5000 * 5000)}")
+        self.set_ts_label(self.t_end, f"{fmt_ms((hi - lo) // 10000 * 10000)} en mémoire")
+        if self.ts_live != self.ts_live_shown:  # on ne touche au bouton que s'il change vraiment
+            self.ts_live_shown = self.ts_live
+            self.b_live.setText("● DIRECT" if self.ts_live else "⏭  Revenir au direct")
+            self.b_live.setStyleSheet("color:#ff4d4d;" if self.ts_live else "background:#7c5cff;color:white;")
+
+    @staticmethod
+    def set_ts_label(lbl, text):
+        if lbl.text() != text:
+            lbl.setText(text)
+
+    def go_live(self):
+        if self.cast or not self.ts_active:
+            return
+        lo, hi = self.ts_bounds()
+        self.ts_seek(max(lo, hi - self.ts_margin))
+
+    def ts_seek(self, ms):
+        """Se déplace dans l'enregistrement : le flux continu est rouvert au bon endroit
+        (comme pour un flux direct, pas de déplacement sur place)."""
+        lo, hi = self.ts_bounds()
+        ms = max(lo, min(ms, hi - 1500))
+        self.ts_open(ms)
+
     def on_error(self, err, msg):
-        if self.cand_i + 1 < len(self.cands):
+        if self.ts_active and "seek" in msg.lower():  # déplacement refusé : on rouvre la liste
+            return self.ts_open(self.ts_last)
+        if self.ts_active:  # le tampon n'a pas pu démarrer : lecture directe classique
+            self.ts_failed = True
+            self.end_timeshift()
+            self.cand_i = 0
+            self.statusBar().showMessage("Direct différé indisponible, lecture directe…")
+            return self.start()
+        if self.cand_i + 1 < len(self.local_cands):
             self.cand_i += 1
             self.start()
         elif self.cands:
@@ -2056,6 +2764,7 @@ class Main(QMainWindow):
             except Exception:
                 pass
         self.player.stop()
+        self.end_timeshift()
 
     def seek_to(self, ms):
         if self.cast:
@@ -2064,7 +2773,10 @@ class Main(QMainWindow):
             except Exception:
                 pass
         else:
-            self.player.setPosition(ms)
+            if self.ts_active:
+                self.ts_seek(ms)
+            else:
+                self.player.setPosition(ms)
 
     def set_volume(self, v):
         self.audio.setVolume(v / 100)
@@ -2092,17 +2804,21 @@ class Main(QMainWindow):
                 pass
             return
         if self.player.isSeekable():
-            self.player.setPosition(max(0, self.player.position() + ms))
+            self.seek_to(max(0, (self.rec_pos() if self.ts_active else self.player.position()) + ms))
 
     def on_state(self, st):
         self.b_play.setText("⏸" if st == QMediaPlayer.PlayingState else "▶")
 
     def on_pos(self, pos):
+        if self.ts_active:
+            return
         if not self.seek.isSliderDown():
             self.seek.setValue(pos)
         self.t_cur.setText(fmt_ms(pos) if self.player.duration() > 0 else "")
 
     def on_dur(self, dur):
+        if self.ts_active:
+            return
         self.seek.setRange(0, max(0, dur))
         self.seek.setEnabled(dur > 0)
         self.t_end.setText(fmt_ms(dur) if dur > 0 else "● DIRECT")
