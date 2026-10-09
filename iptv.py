@@ -9,6 +9,7 @@ import tempfile
 import subprocess
 import threading
 import time
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import sys
 from datetime import datetime
@@ -26,7 +27,7 @@ from PySide6.QtGui import (
     QAction, QActionGroup, QBrush, QColor, QFont, QIcon, QKeySequence, QLinearGradient,
     QFontMetrics, QPainter, QPalette, QPixmap, QPolygonF,
 )
-from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
+from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaMetaData, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QFormLayout,
@@ -36,7 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 APP = "KFluxTV"
-VERSION = "0.6"
+VERSION = "0.7"
 REPO = "KisakePro/KFluxTV"
 _ROAMING = os.getenv("APPDATA", os.path.expanduser("~"))
 DATA_DIR = os.path.join(_ROAMING, "KFluxTV")
@@ -61,18 +62,60 @@ SECTIONS = {
 }
 
 
+def _dpapi(data, protect):
+    """Chiffre / déchiffre avec la protection des données Windows (lié au compte Windows de l'utilisateur)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    buf = ctypes.create_string_buffer(data, len(data))
+    inp, out = BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), BLOB()
+    fn = ctypes.windll.crypt32.CryptProtectData if protect else ctypes.windll.crypt32.CryptUnprotectData
+    if not fn(ctypes.byref(inp), None, None, None, None, 0, ctypes.byref(out)):
+        raise OSError("DPAPI")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(out.pbData)
+
+
+def write_json(path, data):
+    """Écriture atomique : un plantage pendant l'enregistrement ne peut plus corrompre le fichier."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
 def load_profiles():
     try:
         with open(CFG, encoding="utf-8") as f:
-            return json.load(f)
+            profs = json.load(f)
     except Exception:
         return []
+    for p in profs:
+        if "pwd_enc" in p:
+            try:
+                p["pwd"] = _dpapi(base64.b64decode(p["pwd_enc"]), False).decode("utf-8")
+            except Exception:
+                p["pwd"] = ""
+            del p["pwd_enc"]
+    return profs
 
 
-def save_profiles(p):
-    os.makedirs(os.path.dirname(CFG), exist_ok=True)
-    with open(CFG, "w", encoding="utf-8") as f:
-        json.dump(p, f, ensure_ascii=False, indent=2)
+def save_profiles(profs):
+    out = []
+    for p in profs:
+        q = dict(p)
+        try:  # le mot de passe n'est plus stocké en clair
+            q["pwd_enc"] = base64.b64encode(_dpapi(q.pop("pwd", "").encode("utf-8"), True)).decode()
+        except Exception:
+            q["pwd"] = p.get("pwd", "")
+        out.append(q)
+    write_json(CFG, out)
 
 
 SETTINGS = os.path.join(os.path.dirname(CFG), "settings.json")
@@ -87,9 +130,7 @@ def load_settings():
 
 
 def save_settings(d):
-    os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
-    with open(SETTINGS, "w", encoding="utf-8") as f:
-        json.dump(d, f, indent=2)
+    write_json(SETTINGS, d)
 
 
 def parse_input(server, user, pwd):
@@ -104,11 +145,15 @@ def parse_input(server, user, pwd):
     return f"{u.scheme}://{u.netloc}", user.strip(), pwd.strip()
 
 
+HTTP = requests.Session()
+HTTP.headers.update(HEADERS)
+
+
 def api(p, action=None):
     params = {"username": p["user"], "password": p["pwd"]}
     if action:
         params["action"] = action
-    r = requests.get(f"{p['server']}/player_api.php", params=params, headers=HEADERS, timeout=60)
+    r = HTTP.get(f"{p['server']}/player_api.php", params=params, timeout=60)
     r.raise_for_status()
     return r.json()
 
@@ -599,6 +644,31 @@ class FavTree(QTreeWidget):
             QTimer.singleShot(0, lambda: self.on_drop(keys, group))
 
 
+class ElideLabel(QLabel):
+    """Libellé qui raccourcit son texte (…) au lieu d'élargir la fenêtre : titres de chaînes très longs."""
+
+    def minimumSizeHint(self):
+        sz = super().minimumSizeHint()
+        sz.setWidth(40)
+        return sz
+
+    def sizeHint(self):
+        sz = super().sizeHint()
+        sz.setWidth(min(sz.width(), 420))
+        return sz
+
+    def setText(self, text):
+        super().setText(text)
+        self.setToolTip(text)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setPen(self.palette().color(QPalette.WindowText))
+        p.setFont(self.font())
+        txt = self.fontMetrics().elidedText(self.text(), Qt.ElideRight, self.width())
+        p.drawText(self.rect(), int(Qt.AlignVCenter | Qt.AlignLeft), txt)
+
+
 class VideoWidget(QVideoWidget):
     toggleSemi = Signal()
     escape = Signal()
@@ -644,9 +714,9 @@ def probe_stream(url):
     if not exe:
         return None
     try:
-        r = subprocess.run([exe, "-hide_banner", "-rw_timeout", "10000000", "-analyzeduration", "3000000",
-                            "-probesize", "3000000", "-i", url],
-                           capture_output=True, text=True, timeout=40, creationflags=NOWIN)
+        r = subprocess.run([exe, "-hide_banner", "-rw_timeout", "8000000", "-analyzeduration", "2000000",
+                            "-probesize", "2000000", "-i", url],
+                           capture_output=True, text=True, timeout=20, creationflags=NOWIN)
     except Exception:
         return None
     vl = next((l for l in r.stderr.splitlines() if "Video:" in l), None)
@@ -665,25 +735,46 @@ def probe_stream(url):
     )
 
 
-def plan_transcode(url, mode):
-    """Décide si le flux doit être converti pour la Chromecast. None = flux direct."""
-    if mode == "never":
-        return None
-    info = probe_stream(url)
-    if info is None:
-        return None
+_PROBES = {}
+
+
+def probe_cached(key, url=None):
+    """Sonde le flux (mémorisée 10 min par chaîne) ; `url` peut être le flux local de l'enregistrement."""
+    hit = _PROBES.get(key)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    info = probe_stream(url or key)
+    if info:
+        _PROBES[key] = (time.time(), info)
+    return info
+
+
+def build_plan(info, method):
+    """Réglages ffmpeg pour la Chromecast. method : « remux » (copie si compatible) ou « enc » (conversion)."""
+    if info is None:  # source illisible à l'analyse : on essaie quand même
+        return dict(v="copy", h=0, a="enc") if method == "remux" else dict(v="enc", h=720, a="enc")
     blocks = -(-info["w"] // 16) * -(-info["h"] // 16)
     v_ok = (info["vcodec"] == "h264" and "10" not in info["pix"] and info["h"] <= 1080
             and blocks * info["fps"] <= 245000)  # H.264 niveau 4.1 : 1080p30 ou 720p60
     a_ok = info["acodec"] in ("aac", "mp3", "ac3", "eac3", "")
-    if mode == "auto" and v_ok and a_ok:
-        return None
+    copy_v = v_ok and method == "remux"
     h = 0
-    if not v_ok:
+    if not copy_v:
         h = min(info["h"], 720 if info["fps"] > 30 else 1080)
         if h >= info["h"]:
             h = 0
-    return dict(v="copy" if v_ok and mode == "auto" else "enc", h=h, a="copy" if a_ok else "enc")
+    return dict(v="copy" if copy_v else "enc", h=h, a="copy" if (a_ok and method == "remux") else "enc")
+
+
+def plan_transcode(url, mode):
+    """Compatibilité : plan pour un flux (None = flux direct)."""
+    if mode == "never":
+        return None
+    info = probe_cached(url)
+    if info is None:
+        return None
+    plan = build_plan(info, "enc" if mode == "always" else "remux")
+    return None if (mode == "auto" and plan["v"] == "copy" and plan["a"] == "copy") else plan
 
 
 _JOB = None
@@ -726,6 +817,19 @@ def kill_with_parent(proc):
         pass
 
 
+def kill_orphan_ffmpeg():
+    """Arrête les ffmpeg laissés par une ancienne version de KFluxTV (ils gardent une connexion chez le
+    fournisseur) : ceux dont le processus parent n'existe plus et qui écrivent dans un dossier iptvhls_/iptvts_."""
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name like 'ffmpeg%'\" | Where-Object { "
+          "$_.CommandLine -match 'iptv(hls|ts)_' -and -not (Get-Process -Id $_.ParentProcessId -ErrorAction "
+          "SilentlyContinue) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }")
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps], creationflags=NOWIN, timeout=20,
+                       capture_output=True)
+    except Exception:
+        pass
+
+
 def clean_stale_temp():
     """Supprime les enregistrements temporaires laissés par un plantage précédent."""
     base = tempfile.gettempdir()
@@ -749,6 +853,22 @@ def local_ip(remote):
         sk.close()
 
 
+class SourceDown(RuntimeError):
+    """Le fournisseur n'envoie rien (connexion refusée ou coupée)."""
+
+
+class RecSession:
+    """Un enregistrement en cours d'un flux du fournisseur."""
+
+    def __init__(self, src, outdir):
+        self.src, self.dir, self.id = src, outdir, os.path.basename(outdir)
+        self.files = []           # [(durée en s, nom du fichier)]
+        self.stop = threading.Event()
+        self.resp = None
+        self.err = ""
+        self.deleted = 0
+
+
 class Relay:
     """Relais HTTP local pour Chromecast : ajoute les en-têtes CORS (obligatoires pour le HLS),
     réécrit les playlists .m3u8 pour que tous les segments passent aussi par le PC."""
@@ -757,16 +877,12 @@ class Relay:
         self.srv = None
         self.port = 0
         self.srv_lan, self.lan_port = None, 0
-        self.hls_proc = self.hls_dir = self.hls_id = None
+        self.hls_proc = self.hls_dir = self.hls_id = None   # conversion ffmpeg pour la Chromecast
         self.active = set()  # connexions amont en cours (libérées à l'arrêt)
-        self.ts_deleted = 0
-        self.rec_files = []        # enregistrement brut : [(durée en s, nom du fichier)]
-        self.rec_stop = threading.Event()
-        self.rec_resp = None
+        self.rec = None      # enregistrement du flux du fournisseur : la SEULE connexion ouverte
 
     def ffmpeg_cmd(self, url, v, h, a, outdir):
         cmd = [ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-fflags", "+genpts+discardcorrupt",
-               "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                "-i", url, "-map", "0:v:0", "-map", "0:a:0?"]
         if v == "copy":
             cmd += ["-c:v", "copy"]
@@ -783,7 +899,8 @@ class Relay:
         return cmd
 
     def start_hls(self, url, plan):
-        """Lance ffmpeg : conversion du flux en HLS compatible Chromecast, servi sous /h/<id>/."""
+        """Lance ffmpeg : conversion en HLS compatible Chromecast, servi sous /h/<id>/.
+        `url` est le flux local de l'enregistrement : aucune connexion supplémentaire au fournisseur."""
         self.stop_hls()
         self.hls_dir = tempfile.mkdtemp(prefix="iptvhls_")
         self.hls_id = os.path.basename(self.hls_dir)
@@ -794,29 +911,32 @@ class Relay:
 
     def start_timeshift(self, url):
         """Enregistre le flux MPEG-TS du fournisseur tel quel (aucune conversion : lecture identique au direct)
-        par morceaux d'environ 2 s, pour permettre pause / retour arrière."""
+        par morceaux d'environ 2 s. C'est la seule connexion au fournisseur : lecteur local, analyse et
+        Chromecast lisent tous cet enregistrement (beaucoup d'abonnements n'autorisent qu'une connexion)."""
         self.start()
-        self.stop_hls()
-        self.hls_dir = tempfile.mkdtemp(prefix="iptvts_")
-        self.hls_id = os.path.basename(self.hls_dir)
-        self.ts_deleted = 0
-        self.rec_files = []
-        self.rec_stop = threading.Event()
-        threading.Thread(target=self._rec_loop, args=(url, self.rec_stop, self.hls_dir, self.rec_files),
-                         daemon=True).start()
-        return f"http://127.0.0.1:{self.port}/h/{self.hls_id}"
+        cur = self.rec
+        if cur is not None and cur.src == url and not cur.stop.is_set():
+            return f"http://127.0.0.1:{self.port}/h/{cur.id}"
+        self.stop_rec()
+        d = tempfile.mkdtemp(prefix="iptvts_")
+        sess = RecSession(url, d)
+        self.rec = sess
+        threading.Thread(target=self._rec_loop, args=(sess,), daemon=True).start()
+        return f"http://127.0.0.1:{self.port}/h/{sess.id}"
 
-    def _rec_loop(self, url, stop, outdir, files):
+    def _rec_loop(self, sess):
         n, fh, t0, w0, name = 0, None, None, 0.0, None
         pcr_pid = None
-        while not stop.is_set():
+        files = sess.files
+        while not sess.stop.is_set():
             buf, synced = b"", False
             try:
-                r = requests.get(url, headers=HEADERS, stream=True, timeout=15)
+                r = requests.get(sess.src, headers=HEADERS, stream=True, timeout=15)
                 r.raise_for_status()
-                self.rec_resp = r
+                sess.resp = r
+                sess.err = ""
                 for chunk in r.iter_content(65536):
-                    if stop.is_set():
+                    if sess.stop.is_set():
                         break
                     buf += chunk
                     if not synced:  # recale sur les paquets de 188 octets (octet de synchro 0x47)
@@ -850,15 +970,17 @@ class Relay:
                     if fh is None:
                         name = f"r{n:06d}.ts"
                         n += 1
-                        fh = open(os.path.join(outdir, name), "wb")
+                        fh = open(os.path.join(sess.dir, name), "wb")
                         t0, w0 = pcr, now
                     elif t0 is None and pcr is not None:
                         t0 = pcr
                     fh.write(data)
-            except Exception:
-                pass
+            except requests.HTTPError as e:
+                sess.err = f"le fournisseur refuse la connexion (HTTP {e.response.status_code})"
+            except Exception as e:
+                sess.err = sess.err or f"connexion impossible ({type(e).__name__})"
             finally:
-                self.rec_resp = None
+                sess.resp = None
             if fh is not None:  # connexion coupée : on ferme le morceau en cours
                 try:
                     fh.close()
@@ -866,34 +988,44 @@ class Relay:
                 except Exception:
                     pass
                 fh, t0 = None, None
-            if not stop.is_set():
-                time.sleep(1)
+            if not sess.stop.is_set():
+                time.sleep(1)  # le fournisseur libère parfois la connexion précédente avec un délai : on réessaie
 
     def ts_segments(self):
-        return list(self.rec_files)
+        sess = self.rec
+        return list(sess.files) if sess else []
 
     def ts_trim(self, keep_from_ms):
         """Supprime du disque les segments plus anciens que la fenêtre de retour arrière."""
+        sess = self.rec
+        if not sess:
+            return
         t = 0.0
-        for i, (d, name) in enumerate(self.ts_segments()):
+        for i, (d, name) in enumerate(list(sess.files)):
             if (t + d) * 1000 >= keep_from_ms - 15000:
                 break
-            if i >= self.ts_deleted and self.hls_dir:
+            if i >= sess.deleted:
                 try:
-                    os.remove(os.path.join(self.hls_dir, name))
+                    os.remove(os.path.join(sess.dir, name))
                 except OSError:
                     pass
-                self.ts_deleted = i + 1
+                sess.deleted = i + 1
             t += d
 
-    def stop_hls(self):
-        self.rec_stop.set()
-        r = self.rec_resp
+    def stop_rec(self):
+        sess, self.rec = self.rec, None
+        if sess is None:
+            return
+        sess.stop.set()
+        r = sess.resp
         if r is not None:
             try:
                 r.close()
             except Exception:
                 pass
+        shutil.rmtree(sess.dir, ignore_errors=True)
+
+    def stop_hls(self):
         if self.hls_proc:
             try:
                 self.hls_proc.kill()
@@ -903,10 +1035,10 @@ class Relay:
         if self.hls_dir:
             shutil.rmtree(self.hls_dir, ignore_errors=True)
         self.hls_proc, self.hls_dir, self.hls_id = None, None, None
-        self.rec_files = []
 
     def stop_all(self):
         self.stop_hls()
+        self.stop_rec()
         for r in list(self.active):
             try:
                 r.close()
@@ -942,36 +1074,44 @@ class Relay:
             def do_GET(self):
                 self.serve()
 
-            def serve_hls(self, name, head, q):
-                if name == "c.ts":  # flux MPEG-TS continu : les segments enregistrés mis bout à bout
-                    idx = int(q.get("s", ["0"])[0])
-                    sid = relay.hls_id
-                    self.send_response(200)
-                    self.cors()
-                    self.send_header("Content-Type", "video/mp2t")
-                    self.end_headers()
-                    if head:
-                        return
-                    while relay.hls_id == sid and relay.hls_dir:
-                        segs = relay.ts_segments()
-                        if idx >= len(segs):
-                            time.sleep(0.1)
-                            continue
-                        try:
-                            with open(os.path.join(relay.hls_dir, segs[idx][1]), "rb") as fh:
-                                while True:
-                                    b = fh.read(262144)
-                                    if not b:
-                                        break
-                                    self.wfile.write(b)
-                        except FileNotFoundError:
-                            pass  # segment supprimé (hors fenêtre) : on passe au suivant
-                        idx += 1
+            def serve_rec(self, sess, q, head):
+                """Flux MPEG-TS continu : les morceaux enregistrés mis bout à bout (comme un flux direct)."""
+                idx = int(q.get("s", ["0"])[0])
+                self.send_response(200)
+                self.cors()
+                self.send_header("Content-Type", "video/mp2t")
+                self.end_headers()
+                if head:
                     return
+                while relay.rec is sess:
+                    files = list(sess.files)
+                    if idx >= len(files):
+                        time.sleep(0.1)
+                        continue
+                    try:
+                        with open(os.path.join(sess.dir, files[idx][1]), "rb") as fh:
+                            while True:
+                                b = fh.read(262144)
+                                if not b:
+                                    break
+                                self.wfile.write(b)
+                    except FileNotFoundError:
+                        pass  # morceau supprimé (hors fenêtre) : on passe au suivant
+                    idx += 1
+
+            def serve_hls(self, name, head, q):
                 f = os.path.join(relay.hls_dir or "", os.path.basename(name))
-                if name.endswith(".m3u8"):  # attendre le 1er segment
-                    for _ in range(80):
-                        if os.path.exists(f) and os.path.getsize(f) > 0:
+                if name.endswith(".m3u8"):
+                    # on attend 3 segments (sinon le récepteur Chromecast reste sur « chargement »),
+                    # ou au moins 1 après ~25 s
+                    for i in range(120):
+                        n = 0
+                        try:
+                            with open(f, encoding="utf-8") as fh:
+                                n = fh.read().count("#EXTINF")
+                        except OSError:
+                            pass
+                        if n >= 3 or (n >= 1 and i >= 100):
                             break
                         time.sleep(0.25)
                 try:
@@ -1003,11 +1143,14 @@ class Relay:
                 q = parse_qs(urlparse(self.path).query)
                 if path.startswith("/h/"):
                     parts = path.split("/")
-                    if len(parts) == 4 and parts[2] == relay.hls_id:
-                        try:
+                    sess = relay.rec
+                    try:
+                        if len(parts) == 4 and sess is not None and parts[2] == sess.id and parts[3] == "c.ts":
+                            return self.serve_rec(sess, q, head)
+                        if len(parts) == 4 and relay.hls_id and parts[2] == relay.hls_id:
                             return self.serve_hls(parts[3], head, q)
-                        except (BrokenPipeError, ConnectionError, OSError):
-                            return
+                    except (BrokenPipeError, ConnectionError, OSError):
+                        return
                     self.send_response(404)
                     self.end_headers()
                     return
@@ -1363,17 +1506,22 @@ class Main(QMainWindow):
         self.semi = False
         self.cands, self.cand_i = [], 0
         self.local_cands = []
+        self.direct_retries = 0
+        self.cur_name = ""
         self.fav_total, self.fav_missing = 0, False
         self.hc, self.hh = set(), set()  # clés masquées (préfixées par section)
         self.jobs = set()
-        self.img_cache = {}
+        self.img_cache = OrderedDict()  # affiches (bornées : 300 dernières)
         self.card_tok = 0
         self.series_loading = set()
         self.info_cache = {}
         self.cast = None          # Chromecast connecté (None = lecture locale)
         self.cast_devs = {}
+        self.cast_tok, self.cast_try, self.cast_methods_list = 0, 0, ["direct"]
+        self.cast_t0, self.cast_playing, self.cast_sent = None, False, 0.0
         self.relay = Relay()
         clean_stale_temp()
+        threading.Thread(target=kill_orphan_ffmpeg, daemon=True).start()
         self.zc = None
         self.cast_menu = QMenu("&Diffusion", self)
         self.cast_event.connect(self.on_cast_event)
@@ -1398,7 +1546,10 @@ class Main(QMainWindow):
         self.search = QLineEdit()
         self.search.setPlaceholderText("🔍  Rechercher…")
         self.search.setClearButtonEnabled(True)
-        self.search.textChanged.connect(lambda _: self.filter())
+        self.search_timer = QTimer(self)
+        self.search_timer.setSingleShot(True)
+        self.search_timer.timeout.connect(self.filter)
+        self.search.textChanged.connect(lambda _: self.search_timer.start(250))
         self.tabs = QTabWidget()
         self.sec = {}
         self.tree_sec = {}
@@ -1486,9 +1637,10 @@ class Main(QMainWindow):
         self.player.positionChanged.connect(self.on_pos)
         self.player.durationChanged.connect(self.on_dur)
         self.player.playbackStateChanged.connect(self.on_state)
+        self.player.metaDataChanged.connect(self.update_quality)
         self.audio.setVolume(0.7)
 
-        self.title = QLabel("Aucune lecture")
+        self.title = ElideLabel("Aucune lecture")
         self.title.setObjectName("title")
         self.b_play = QPushButton("▶")
         self.b_play.setObjectName("round")
@@ -1498,6 +1650,7 @@ class Main(QMainWindow):
         b_stop.clicked.connect(self.stop)
         self.seek = QSlider(Qt.Horizontal)
         self.seek.setEnabled(False)
+        self.seek.setMinimumWidth(160)
         self.seek.sliderMoved.connect(self.seek_to)
         self.seek.sliderReleased.connect(lambda: self.seek_to(self.seek.value()))
         self.t_cur = QLabel("--:--")
@@ -1522,6 +1675,7 @@ class Main(QMainWindow):
         bl = QVBoxLayout(self.barw)
         bl.setContentsMargins(0, 6, 0, 0)
         self.epg = EpgBar()
+        self.epg.timer.timeout.connect(lambda: self.refresh_title())
         self.epg.setVisible(False)
         self.epg_tok = 0
         bl.addWidget(self.epg)
@@ -1545,9 +1699,22 @@ class Main(QMainWindow):
         self.b_live.setFixedWidth(160)
         r2.addWidget(b_back)
         r2.addWidget(b_fwd)
-        r2.addWidget(self.b_live)
+        self.b_replay = QPushButton("⏺  Replay")
+        self.b_replay.setCheckable(True)
+        self.b_replay.setChecked(load_settings().get("timeshift", True))
+        self.b_replay.setToolTip("Mode replay (direct différé) : pause et retour arrière sur les chaînes en direct.\n"
+                                 "Garde le direct en mémoire tampon sur le disque. Décoché : flux direct seul.")
+        self.b_replay.toggled.connect(self.set_replay)
+        self.style_replay()
         r2.addSpacing(8)
         r2.addWidget(self.title, 1)
+        self.q_info = QLabel("")
+        self.q_info.setObjectName("muted")
+        self.q_info.setToolTip("Qualité réellement envoyée par le fournisseur")
+        r1.addWidget(self.q_info)
+        r1.addSpacing(6)
+        r1.addWidget(self.b_live)
+        r1.addWidget(self.b_replay)
         r2.addWidget(QLabel("🔊"))
         r2.addWidget(self.vol)
         r2.addSpacing(8)
@@ -1577,10 +1744,22 @@ class Main(QMainWindow):
         self.devices.audioOutputsChanged.connect(self.fill_audio_menu)
         self.fill_audio_menu()
         self.fill_cast_menu()
-        self.statusBar().showMessage("Prêt")
+        sb = self.statusBar()
+        _show = sb.showMessage
+        sb.showMessage = lambda text, ms=0: _show(self.redact(text), ms)
+        sb.showMessage("Prêt")
         QTimer.singleShot(0, self.auto_start)
         if load_settings().get("auto_update", True) and getattr(sys, "frozen", False):
             QTimer.singleShot(5000, self.startup_update_check)
+
+    def redact(self, text):
+        """Masque identifiant et mot de passe (les erreurs réseau contiennent l'adresse complète du flux)."""
+        p = self.profile
+        if p:
+            for secret in (p.get("pwd"), p.get("user")):
+                if secret and len(secret) > 2:
+                    text = str(text).replace(secret, "•••")
+        return text
 
     def make_tree(self, cls=QTreeWidget):
         t = cls()
@@ -1722,6 +1901,7 @@ class Main(QMainWindow):
         self.run_job(fetch_latest, ok, lambda m: None)
 
     def use_profile(self, p):
+        self.stop()
         self.profile = p
         self.hc = set(p.get("hidden_cats", []))
         self.hh = set(p.get("hidden_chs", []))
@@ -1744,7 +1924,7 @@ class Main(QMainWindow):
                 self.logout()
 
     def logout(self):
-        self.player.stop()
+        self.stop()
         self.profile = None
         self.clear_sections()
         self.title.setText("Aucune lecture")
@@ -1837,7 +2017,7 @@ class Main(QMainWindow):
         def fail(m):
             sec.loading = False
             self.statusBar().showMessage("Erreur")
-            QMessageBox.critical(self, APP, f"{sec.title.strip()} : {m}")
+            QMessageBox.critical(self, APP, self.redact(f"{sec.title.strip()} : {m}"))
 
         self.run_job(work, ok, fail)
 
@@ -1951,7 +2131,7 @@ class Main(QMainWindow):
             self.series_loading.discard(sid)
             self.statusBar().showMessage("Erreur : " + m)
 
-        self.run_job(lambda: requests.get(
+        self.run_job(lambda: HTTP.get(
             f"{p['server']}/player_api.php",
             params={"username": p["user"], "password": p["pwd"], "action": "get_series_info", "series_id": sid},
             headers=HEADERS, timeout=60).json(), ok, fail)
@@ -2311,7 +2491,7 @@ class Main(QMainWindow):
             self.info_cache[vid] = data
             apply(data)
 
-        self.run_job(lambda: requests.get(
+        self.run_job(lambda: HTTP.get(
             f"{p['server']}/player_api.php",
             params={"username": p["user"], "password": p["pwd"], "action": "get_vod_info", "vod_id": vid},
             headers=HEADERS, timeout=30).json(), ok, lambda m: None)
@@ -2320,15 +2500,18 @@ class Main(QMainWindow):
         if not url or not str(url).startswith("http"):
             return
         if url in self.img_cache:
+            self.img_cache.move_to_end(url)
             return self.set_poster(self.img_cache[url], tok)
 
         def ok(b):
             pm = QPixmap()
             if b and pm.loadFromData(b):
                 self.img_cache[url] = pm
+                while len(self.img_cache) > 300:
+                    self.img_cache.popitem(last=False)
                 self.set_poster(pm, tok)
 
-        self.run_job(lambda: requests.get(url, headers=HEADERS, timeout=15).content, ok, lambda m: None)
+        self.run_job(lambda: HTTP.get(url, timeout=15).content, ok, lambda m: None)
 
     def set_poster(self, pm, tok):
         if tok == self.card_tok:
@@ -2422,7 +2605,7 @@ class Main(QMainWindow):
             if old is not None:
                 self.cast_release(old)
             self.player.stop()
-            self.end_timeshift()
+            self.end_timeshift(keep_rec=True)  # l'enregistrement reste la seule connexion et alimente la TV
             self.cast = c
             c.media_controller.register_status_listener(CastListener(self.cast_event))
             try:
@@ -2482,44 +2665,132 @@ class Main(QMainWindow):
         if self.cast and self.cands:
             self.start()
 
+    def cast_methods(self, live):
+        mode = load_settings().get("cast_mode", "auto")
+        if not live or mode == "never" or not ffmpeg_exe():
+            return ["direct"]
+        return ["enc", "direct"] if mode == "always" else ["remux", "enc", "direct"]
+
     def cast_play(self):
-        url, c = self.cands[self.cand_i], self.cast
-        ext = url.rsplit(".", 1)[-1].lower()
-        ctype, live = self.CTYPES.get(ext, "video/mp4"), "/live/" in url
+        """Envoie la lecture en cours vers la TV. En cas d'échec (erreur ou rien ne démarre en 25 s),
+        les méthodes suivantes sont essayées automatiquement."""
+        self.cast_tok += 1
+        self.cast_methods_list = self.cast_methods("/live/" in self.cands[0])
+        self.cast_try = 0
+        self.cast_send(self.cast_tok)
+
+    def cast_send(self, tok):
+        c = self.cast
+        method = self.cast_methods_list[self.cast_try]
+        url = self.cands[0]
+        live = "/live/" in url
         title = self.title.text()
-        self.statusBar().showMessage(f"Envoi vers {c.name}…")
+        src = url[:-5] + ".ts" if url.endswith(".m3u8") else url
+        n = len(self.cast_methods_list)
+        self.cast_t0, self.cast_playing = None, False
+        self.statusBar().showMessage(f"Envoi vers {c.name}…" + (f" (méthode {self.cast_try + 1}/{n})" if self.cast_try else ""))
 
         def work():
             mc = c.media_controller
-            ct = ctype
-            plan = None
-            if live:
-                src = url[:-5] + ".ts" if url.endswith(".m3u8") else url
-                plan = plan_transcode(src, load_settings().get("cast_mode", "auto"))
-            if plan:
-                purl = self.relay.transcode_url(src, c.cast_info.host, plan)
-                ct = "application/x-mpegURL"
-            else:
+            if method == "direct":
+                # dernier recours : la TV lit la playlist du fournisseur (connexion directe, on libère l'autre)
+                self.relay.stop_rec()
                 self.relay.stop_hls()
+                if tok != self.cast_tok:
+                    return "stale"
                 purl = self.relay.url_for(url, c.cast_info.host)
+                ct = self.CTYPES.get(url.rsplit(".", 1)[-1].lower(), "video/mp4")
+            else:
+                base = self.relay.start_timeshift(src)  # réutilise l'enregistrement si c'est la même chaîne
+                sess = self.relay.rec
+                for _ in range(60):  # il faut au moins 2 morceaux (~4 s) avant de commencer
+                    if tok != self.cast_tok:
+                        return "stale"
+                    if len(sess.files) >= 2:
+                        break
+                    time.sleep(0.25)
+                if len(sess.files) < 2:
+                    raise SourceDown("flux indisponible : " + (sess.err or "aucune donnée reçue"))
+                local = f"{base}/c.ts?s={max(0, len(sess.files) - 3)}"
+                info = probe_cached(src, local)
+                if tok != self.cast_tok:
+                    return "stale"
+                purl = self.relay.transcode_url(local, c.cast_info.host, build_plan(info, method))
+                ct = "application/x-mpegURL"
+            if tok != self.cast_tok:
+                return "stale"
+            self.cast_sent = time.time()
             mc.play_media(purl, ct, title=title, stream_type="LIVE" if live else "BUFFERED")
-            mc.block_until_active(15)
+            mc.block_until_active(20)
+            return "sent"
 
-        self.run_job(work, lambda _: self.statusBar().showMessage(f"Diffusion sur {c.name}"),
-                     lambda m: self.statusBar().showMessage(f"Erreur Chromecast : {m}"))
+        def ok(res):
+            if res == "sent" and tok == self.cast_tok:
+                self.cast_t0 = time.time()  # la surveillance démarre : la TV doit lire dans les 25 s
+
+        def fail(m):
+            if tok != self.cast_tok:
+                return
+            if m.startswith("flux indisponible"):
+                # la source elle-même ne répond pas : les autres méthodes échoueraient pareil
+                self.cast_t0 = None
+                self.statusBar().showMessage(f"La TV ne peut rien recevoir : {m}.")
+                return self.explain_failure()
+            self.statusBar().showMessage(f"Erreur Chromecast : {m}")
+            self.cast_fallback(tok)
+
+        self.run_job(work, ok, fail)
+
+    def cast_fallback(self, tok):
+        if tok != self.cast_tok or not self.cast:
+            return
+        self.cast_t0 = None
+        if self.cast_try + 1 < len(self.cast_methods_list):
+            self.cast_try += 1
+            self.cast_send(tok)
+        else:
+            self.statusBar().showMessage("La TV n'arrive pas à lire ce flux (essayé : "
+                                         + ", ".join(self.cast_methods_list) + ").")
+            self.explain_failure()
+
+    def explain_failure(self):
+        """Cherche la cause la plus fréquente d'un flux qui ne démarre pas : limite de connexions du compte."""
+        p = self.profile
+        if not p:
+            return
+
+        def ok(data):
+            ui = data.get("user_info", {}) if isinstance(data, dict) else {}
+            act, mx = as_int(ui.get("active_cons")), as_int(ui.get("max_connections"))
+            sess = self.relay.rec
+            why = f" Cause : {sess.err}." if sess is not None and sess.err else ""
+            if mx and act >= mx:
+                self.statusBar().showMessage(
+                    f"Connexions du compte saturées ({act}/{mx}) : ferme les autres lecteurs ou appareils "
+                    f"qui utilisent ce compte, puis réessaie.{why}")
+            elif why:
+                self.statusBar().showMessage("La TV n'arrive pas à lire ce flux." + why)
+
+        self.run_job(lambda: api(p), ok, lambda m: None)
 
     def on_cast_event(self, state, reason):
         self.b_play.setText("⏸" if state in ("PLAYING", "BUFFERING") else "▶")
-        if state == "IDLE" and reason == "ERROR" and self.cast:
-            if self.cand_i + 1 < len(self.cands):
-                self.cand_i += 1
-                self.cast_play()
-            else:
-                self.statusBar().showMessage("La TV n'a pas pu lire ce flux (format non pris en charge ?).")
+        if state == "PLAYING" and not self.cast_playing and self.cast:
+            self.cast_playing = True
+            self.cast_t0 = None
+            self.statusBar().showMessage(f"Diffusion sur {self.cast.name}")
+        elif state == "IDLE" and reason == "ERROR" and self.cast and not self.cast_playing:
+            if time.time() - self.cast_sent > 2.5:  # on ignore l'erreur résiduelle du flux précédent
+                self.cast_fallback(self.cast_tok)
 
     def cast_tick(self):
         if not self.cast:
             return
+        if self.cast_t0 and not self.cast_playing and time.time() - self.cast_t0 > 25:
+            self.cast_fallback(self.cast_tok)  # rien n'est arrivé sur la TV
+        if not self.ts_active and self.relay.rec is not None:  # pas de lecteur local : on borne l'enregistrement
+            hi = int(sum(d for d, _ in self.relay.ts_segments()) * 1000)
+            self.relay.ts_trim(max(0, hi - 600000))
         try:
             st = self.cast.media_controller.status
         except Exception:
@@ -2574,8 +2845,10 @@ class Main(QMainWindow):
             name = f"{serie} — {item.text(0)}" if serie else item.text(0)
         else:
             return
-        self.title.setText(clean_title(name))
+        self.cur_name = clean_title(name)
+        self.title.setText(self.cur_name)
         self.ts_failed = False
+        self.direct_retries = 0
         self.epg_tok += 1
         self.epg.setVisible(kind == "ch")
         if kind == "ch":
@@ -2583,12 +2856,21 @@ class Main(QMainWindow):
         self.cands, self.cand_i = urls, 0
         self.start()
 
+    def refresh_title(self):
+        """Nom de la chaîne + programme en cours (mis à jour quand le programme change)."""
+        if not self.epg.isVisible():
+            return
+        cur = self.epg.canvas.current()
+        t = f"{self.cur_name}  ·  {cur['title']}" if cur else self.cur_name
+        if self.title.text() != t:
+            self.title.setText(t)
+
     def fetch_epg(self, sid, name):
         p, tok = self.profile, self.epg_tok
         self.epg.message("Chargement du programme…")
 
         def get(action, **kw):
-            r = requests.get(f"{p['server']}/player_api.php", headers=HEADERS, timeout=30,
+            r = HTTP.get(f"{p['server']}/player_api.php", timeout=30,
                              params={"username": p["user"], "password": p["pwd"], "action": action,
                                      "stream_id": sid, **kw})
             return parse_epg(r.json())
@@ -2601,8 +2883,7 @@ class Main(QMainWindow):
                 return
             self.epg.show_items(items)
             cur = self.epg.canvas.current()
-            if cur:
-                self.title.setText(f"{name}  ·  {cur['title']}")
+            self.refresh_title()
 
         def fail(m):
             if tok == self.epg_tok:
@@ -2630,22 +2911,74 @@ class Main(QMainWindow):
             self.ts_timer.start(1000)
             self.ts_open(0)
             return
+        self.q_info.setText("")
         self.end_timeshift()
+        self.relay.stop_rec()  # lecture directe : une seule connexion au fournisseur
         cands = self.cands
         if "/live/" in cands[0]:  # le flux .ts brut est bien plus régulier que la playlist .m3u8
             ts = cands[0][:-5] + ".ts" if cands[0].endswith(".m3u8") else cands[0]
             cands = [ts, ts[:-3] + ".m3u8"]
         self.local_cands = cands
+        self.player.setSource(QUrl())  # même adresse qu'avant (nouvel essai) : on force le rechargement
         self.player.setSource(QUrl(cands[min(self.cand_i, len(cands) - 1)]))
         self.player.play()
 
-    def end_timeshift(self):
+    def set_replay(self, on):
+        st = load_settings()
+        st["timeshift"] = on
+        save_settings(st)
+        self.style_replay()
+        if self.cast is None and self.cands and "/live/" in self.cands[0]:
+            self.cand_i, self.ts_failed, self.direct_retries = 0, False, 0
+            self.start()  # on relance la chaîne dans le mode choisi
+        self.statusBar().showMessage("Mode replay activé : pause et retour arrière possibles." if on
+                                     else "Mode replay désactivé : flux direct, rien n'est gardé en mémoire.")
+
+    def style_replay(self):
+        on = self.b_replay.isChecked()
+        self.b_replay.setStyleSheet("background:#7c5cff;color:white;" if on else "")
+
+    def update_quality(self):
+        """Affiche la qualité réelle du flux (résolution, images/s, débit)."""
+        md = self.player.metaData()
+        res = md.value(QMediaMetaData.Resolution)
+        fps = md.value(QMediaMetaData.VideoFrameRate)
+        parts = []
+        if res is not None and hasattr(res, "height") and res.height() > 0:
+            parts.append(f"{res.height()}p")
+        try:
+            if fps and float(fps) > 0:
+                parts.append(f"{round(float(fps))} i/s")
+        except (TypeError, ValueError):
+            pass
+        mbps = 0.0
+        files = self.relay.ts_segments() if self.ts_active else []
+        if len(files) >= 3:  # débit mesuré sur l'enregistrement (≈ 20 dernières secondes)
+            last = files[-10:]
+            try:
+                size = sum(os.path.getsize(os.path.join(self.relay.rec.dir, n)) for _, n in last)
+                dur = sum(d for d, _ in last)
+                mbps = size * 8 / max(dur, 0.1) / 1e6
+            except (OSError, AttributeError):
+                pass
+        else:
+            br = md.value(QMediaMetaData.VideoBitRate)
+            try:
+                mbps = float(br) / 1e6 if br else 0.0
+            except (TypeError, ValueError):
+                pass
+        if mbps > 0:
+            parts.append(f"{mbps:.1f} Mb/s".replace(".", ","))
+        self.q_info.setText("  ·  ".join(parts))
+
+    def end_timeshift(self, keep_rec=False):
         was = self.ts_active
         self.ts_active = False
         self.ts_timer.stop()
         self.b_live.setVisible(False)
         if was:
-            self.relay.stop_hls()
+            if not keep_rec:
+                self.relay.stop_rec()
             self.on_dur(0)
 
     def rec_pos(self):
@@ -2706,6 +3039,8 @@ class Main(QMainWindow):
             self.ts_live = True
         self.set_ts_label(self.t_cur, "" if self.ts_live else f"-{fmt_ms(behind // 5000 * 5000)}")
         self.set_ts_label(self.t_end, f"{fmt_ms((hi - lo) // 10000 * 10000)} en mémoire")
+        if len(self.ts_hist) % 5 == 0:
+            self.update_quality()
         if self.ts_live != self.ts_live_shown:  # on ne touche au bouton que s'il change vraiment
             self.ts_live_shown = self.ts_live
             self.b_live.setText("● DIRECT" if self.ts_live else "⏭  Revenir au direct")
@@ -2738,8 +3073,16 @@ class Main(QMainWindow):
             self.cand_i = 0
             self.statusBar().showMessage("Direct différé indisponible, lecture directe…")
             return self.start()
+        if self.direct_retries < 4 and self.local_cands and "/live/" in self.local_cands[0]:
+            # le fournisseur garde souvent l'ancienne connexion quelques secondes (zapping, bascule
+            # replay / direct) : on réessaie la même adresse avant de passer à la suivante
+            self.direct_retries += 1
+            self.statusBar().showMessage("Connexion au flux…")
+            QTimer.singleShot(1500, lambda: self.cast is None and self.start())
+            return
         if self.cand_i + 1 < len(self.local_cands):
             self.cand_i += 1
+            self.direct_retries = 0
             self.start()
         elif self.cands:
             self.statusBar().showMessage(f"Lecture impossible : {msg}")
@@ -2883,4 +3226,6 @@ if __name__ == "__main__":
     apply_theme(app)
     w = Main()
     w.show()
-    sys.exit(app.exec())
+    code = app.exec()
+    w.relay.stop_all()
+    os._exit(code)  # des requêtes réseau peuvent encore tourner : on ne les attend pas
