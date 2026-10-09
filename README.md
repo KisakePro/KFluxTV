@@ -15,6 +15,7 @@ Lecteur de flux **Xtream Codes** pour Windows : TV en direct, films, séries, gu
 - Mode **semi plein écran** (la vidéo remplit la fenêtre) et plein écran
 - Choix de la sortie audio
 - **Chromecast** : diffusion sur TV, avec conversion automatique (ffmpeg intégré) des flux que la Chromecast ne lit pas (ex. 1080p 50 images/s)
+- **Fire TV** : via l'application gratuite AirScreen (mode Google Cast), la TV apparaît dans le menu Diffusion
 - Options et fenêtre de **mise à jour** intégrée (GitHub Releases)
 
 ## Installation

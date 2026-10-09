@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 APP = "KFluxTV"
-VERSION = "0.7"
+VERSION = "0.7.1"
 REPO = "KisakePro/KFluxTV"
 _ROAMING = os.getenv("APPDATA", os.path.expanduser("~"))
 DATA_DIR = os.path.join(_ROAMING, "KFluxTV")
@@ -756,7 +756,7 @@ def build_plan(info, method):
     blocks = -(-info["w"] // 16) * -(-info["h"] // 16)
     v_ok = (info["vcodec"] == "h264" and "10" not in info["pix"] and info["h"] <= 1080
             and blocks * info["fps"] <= 245000)  # H.264 niveau 4.1 : 1080p30 ou 720p60
-    a_ok = info["acodec"] in ("aac", "mp3", "ac3", "eac3", "")
+    a_ok = info["acodec"] in ("aac", "mp3", "")
     copy_v = v_ok and method == "remux"
     h = 0
     if not copy_v:
@@ -882,8 +882,10 @@ class Relay:
         self.rec = None      # enregistrement du flux du fournisseur : la SEULE connexion ouverte
 
     def ffmpeg_cmd(self, url, v, h, a, outdir):
+        # lecture à vitesse réelle après un démarrage rapide de 16 s : la liste HLS se remplit tout de suite
+        # (le récepteur peut démarrer avec de la réserve), puis l'enregistrement garde son avance sur le direct
         cmd = [ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-fflags", "+genpts+discardcorrupt",
-               "-i", url, "-map", "0:v:0", "-map", "0:a:0?"]
+               "-readrate", "1", "-readrate_initial_burst", "16", "-i", url, "-map", "0:v:0", "-map", "0:a:0?"]
         if v == "copy":
             cmd += ["-c:v", "copy"]
         else:
@@ -893,7 +895,7 @@ class Relay:
             if h:
                 cmd += ["-vf", f"scale=-2:{h}"]
         cmd += ["-c:a", "copy"] if a == "copy" else ["-c:a", "aac", "-b:a", "160k", "-ac", "2"]
-        cmd += ["-f", "hls", "-hls_time", "2", "-hls_list_size", "10",
+        cmd += ["-f", "hls", "-hls_time", "2", "-hls_list_size", "15",
                 "-hls_flags", "delete_segments+independent_segments",
                 "-hls_segment_filename", os.path.join(outdir, "seg%05d.ts"), os.path.join(outdir, "index.m3u8")]
         return cmd
@@ -1102,8 +1104,8 @@ class Relay:
             def serve_hls(self, name, head, q):
                 f = os.path.join(relay.hls_dir or "", os.path.basename(name))
                 if name.endswith(".m3u8"):
-                    # on attend 3 segments (sinon le récepteur Chromecast reste sur « chargement »),
-                    # ou au moins 1 après ~25 s
+                    # on attend 6 segments (le récepteur démarre 14 s avant la fin de la liste, voir plus bas),
+                    # 3 après ~10 s, ou au moins 1 après ~25 s
                     for i in range(120):
                         n = 0
                         try:
@@ -1111,7 +1113,7 @@ class Relay:
                                 n = fh.read().count("#EXTINF")
                         except OSError:
                             pass
-                        if n >= 3 or (n >= 1 and i >= 100):
+                        if n >= 6 or (n >= 3 and i >= 40) or (n >= 1 and i >= 100):
                             break
                         time.sleep(0.25)
                 try:
@@ -1122,6 +1124,10 @@ class Relay:
                     self.cors()
                     self.end_headers()
                     return
+                if name.endswith(".m3u8") and b"#EXT-X-START" not in body:
+                    # le récepteur démarre 14 s avant la fin : réserve contre les à-coups (sinon il lit au ras
+                    # du direct avec 3 segments d'avance et se remet en mémoire tampon sans arrêt)
+                    body = body.replace(b"#EXTM3U", b"#EXTM3U" + bytes([10]) + b"#EXT-X-START:TIME-OFFSET=-14,PRECISE=YES", 1)
                 self.send_response(200)
                 self.cors()
                 self.send_header("Content-Type", "application/vnd.apple.mpegurl" if name.endswith(".m3u8")
@@ -1491,11 +1497,11 @@ class CastListener:
         self.sig = sig
 
     def new_media_status(self, status):
-        self.sig.emit(status.player_state or "", status.idle_reason or "")
+        self.sig.emit(status.player_state or "", status.idle_reason or "", status.content_id or "")
 
 
 class Main(QMainWindow):
-    cast_event = Signal(str, str)
+    cast_event = Signal(str, str, str)
 
     def __init__(self):
         super().__init__()
@@ -1519,6 +1525,7 @@ class Main(QMainWindow):
         self.cast_devs = {}
         self.cast_tok, self.cast_try, self.cast_methods_list = 0, 0, ["direct"]
         self.cast_t0, self.cast_playing, self.cast_sent = None, False, 0.0
+        self.cast_purl = ""
         self.relay = Relay()
         clean_stale_temp()
         threading.Thread(target=kill_orphan_ffmpeg, daemon=True).start()
@@ -2703,7 +2710,7 @@ class Main(QMainWindow):
             else:
                 base = self.relay.start_timeshift(src)  # réutilise l'enregistrement si c'est la même chaîne
                 sess = self.relay.rec
-                for _ in range(60):  # il faut au moins 2 morceaux (~4 s) avant de commencer
+                for _ in range(180):  # au moins 2 morceaux ; le fournisseur peut mettre ~30 s à libérer l'ancienne chaîne
                     if tok != self.cast_tok:
                         return "stale"
                     if len(sess.files) >= 2:
@@ -2711,7 +2718,7 @@ class Main(QMainWindow):
                     time.sleep(0.25)
                 if len(sess.files) < 2:
                     raise SourceDown("flux indisponible : " + (sess.err or "aucune donnée reçue"))
-                local = f"{base}/c.ts?s={max(0, len(sess.files) - 3)}"
+                local = f"{base}/c.ts?s={max(0, len(sess.files) - 8)}"
                 info = probe_cached(src, local)
                 if tok != self.cast_tok:
                     return "stale"
@@ -2720,6 +2727,7 @@ class Main(QMainWindow):
             if tok != self.cast_tok:
                 return "stale"
             self.cast_sent = time.time()
+            self.cast_purl = purl
             mc.play_media(purl, ct, title=title, stream_type="LIVE" if live else "BUFFERED")
             mc.block_until_active(20)
             return "sent"
@@ -2766,14 +2774,16 @@ class Main(QMainWindow):
             why = f" Cause : {sess.err}." if sess is not None and sess.err else ""
             if mx and act >= mx:
                 self.statusBar().showMessage(
-                    f"Connexions du compte saturées ({act}/{mx}) : ferme les autres lecteurs ou appareils "
-                    f"qui utilisent ce compte, puis réessaie.{why}")
+                    f"Connexions du compte saturées ({act}/{mx}) : un autre appareil utilise le compte, ou le "
+                    f"fournisseur n'a pas encore libéré la chaîne précédente. Réessaie dans quelques secondes.{why}")
             elif why:
                 self.statusBar().showMessage("La TV n'arrive pas à lire ce flux." + why)
 
         self.run_job(lambda: api(p), ok, lambda m: None)
 
-    def on_cast_event(self, state, reason):
+    def on_cast_event(self, state, reason, cid=""):
+        if cid and self.cast_purl and cid != self.cast_purl:
+            return  # état du flux précédent (changement de chaîne) : on l'ignore
         self.b_play.setText("⏸" if state in ("PLAYING", "BUFFERING") else "▶")
         if state == "PLAYING" and not self.cast_playing and self.cast:
             self.cast_playing = True
