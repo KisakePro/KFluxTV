@@ -1,0 +1,8 @@
+build/
+dist/
+release/
+*.spec
+__pycache__/
+version.txt
+profiles.json
+settings.json
