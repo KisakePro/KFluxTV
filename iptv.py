@@ -9,7 +9,7 @@ import tempfile
 import subprocess
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import sys
 from datetime import datetime
@@ -22,7 +22,7 @@ try:
     import zeroconf
 except Exception:  # Chromecast optionnel
     pychromecast = zeroconf = None
-from PySide6.QtCore import QPointF, QRectF, Qt, QThread, QTimer, Signal, QUrl
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QThread, QTimer, Signal, QUrl
 from PySide6.QtGui import (
     QAction, QActionGroup, QBrush, QColor, QFont, QIcon, QKeySequence, QLinearGradient,
     QFontMetrics, QPainter, QPalette, QPixmap, QPolygonF,
@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 APP = "KFluxTV"
-VERSION = "0.7.1"
+VERSION = "0.7.2"
 REPO = "KisakePro/KFluxTV"
 _ROAMING = os.getenv("APPDATA", os.path.expanduser("~"))
 DATA_DIR = os.path.join(_ROAMING, "KFluxTV")
@@ -644,6 +644,169 @@ class FavTree(QTreeWidget):
             QTimer.singleShot(0, lambda: self.on_drop(keys, group))
 
 
+class DebugOverlay(QWidget):
+    """Fenêtre transparente posée sur la vidéo : santé du flux (fournisseur, réserve, TV) sur 2 minutes."""
+
+    W, H = 500, 290
+    COL = {"P": QColor("#39d98a"), "B": QColor("#ffb020"), "I": QColor("#ff4d4d"), "Z": QColor("#8b90a0"),
+           "-": QColor("#3a3e4d")}
+
+    def __init__(self, main):
+        super().__init__(main, Qt.Tool | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.main = main
+        self.hist = deque(maxlen=120)
+        self.resize(self.W, self.H)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+
+    def start(self):
+        self.hist.clear()
+        self.tick()
+        self.timer.start(1000)
+        self.show()
+
+    def stop(self):
+        self.timer.stop()
+        self.hide()
+
+    def reposition(self):
+        v = self.main.video
+        if v.isVisible():
+            self.move(v.mapToGlobal(QPoint(12, 12)))
+
+    def tick(self):
+        self.hist.append(self.main.debug_sample())
+        self.reposition()
+        self.update()
+
+    def diagnosis(self):
+        h = list(self.hist)[-60:]
+        if not h:
+            return "", QColor("#8b90a0")
+        last = h[-1]
+        if last["mode"] == "Direct":
+            return "Active le Replay pour mesurer le flux du fournisseur", QColor("#8b90a0")
+        gap = max((x["gap"] or 0) for x in h)
+        # chaque arrêt de lecture (passage en mémoire tampon) est classé selon la réserve à ce moment-là
+        starts = [b for a, b in zip(h, h[1:]) if b["state"] == "B" and a["state"] != "B"]
+        cut = sum(1 for x in starts if x["cushion"] is not None and x["cushion"] < 3)
+        ok_res = sum(1 for x in starts if x["cushion"] is None or x["cushion"] >= 5)
+        if cut:
+            return f"⚠ Coupures du fournisseur ({cut} arrêts, silence max {gap:.0f} s) : augmente le retard volontaire",                 QColor("#ff4d4d")
+        if ok_res >= 2:
+            who = "la TV ou le Wi-Fi" if last["mode"] == "TV" else "le lecteur"
+            return f"⚠ Le flux arrive bien : c'est {who} qui peine ({ok_res} arrêts)", QColor("#ffb020")
+        if gap >= 3:
+            return f"Silences du fournisseur (jusqu'à {gap:.0f} s) absorbés par la réserve", QColor("#ffb020")
+        return "✔ Flux régulier", QColor("#39d98a")
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(12, 13, 18, 225))
+        p.drawRoundedRect(QRectF(0, 0, self.W, self.H), 12, 12)
+        h = list(self.hist)
+        last = h[-1] if h else {}
+        f = QFont(self.font())
+        f.setPointSizeF(8.5)
+        p.setFont(f)
+
+        def line(y, text, color="#e6e8ef", bold=False):
+            f.setBold(bold)
+            p.setFont(f)
+            p.setPen(QColor(color))
+            p.drawText(QPointF(14, y), text)
+
+        num = lambda v, d=1: "—" if v is None else f"{v:.{d}f}".replace(".", ",")
+        rates = [x["rate"] for x in h if x["rate"] is not None][-120:]
+        avg = sum(rates) / len(rates) if rates else None
+        stalls = sum(1 for a, b in zip(h, h[1:]) if b["state"] == "B" and a["state"] != "B")
+        line(22, f"DEBUG FLUX   ·   {last.get('mode', '—')}   ·   {last.get('quality') or 'qualité inconnue'}",
+             "#ffffff", True)
+        r5 = [x["rate"] for x in h[-5:] if x["rate"] is not None]
+        line(42, f"Fournisseur : {num(sum(r5) / len(r5) if r5 else None)} Mb/s  (moyenne 2 min {num(avg)})   ·   silence max "
+                 f"{num(max([x['gap'] or 0 for x in h] or [0]))} s   ·   reconnexions {last.get('reconnects', 0)}")
+        tv = f"   ·   envoi TV : {num(last.get('tx'))} Mb/s" if last.get("mode") == "TV" else ""
+        line(60, f"Réserve : {num(last.get('cushion'), 0)} s  (retard voulu {last.get('target', 0):.0f} s){tv}"
+                 f"   ·   arrêts lecture : {stalls}")
+        if last.get("err"):
+            line(78, f"Fournisseur : {last['err']}", "#ff8080")
+        # --- graphique (2 min)
+        gx, gy, gw, gh = 14, 92, self.W - 28, 130
+        p.setPen(QColor(255, 255, 255, 30))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(QRectF(gx, gy, gw, gh))
+        bw = gw / 120.0
+        off = 120 - len(h)
+        vals = sorted([x["rate"] or 0 for x in h] + [x["tx"] or 0 for x in h] + [1.0])
+        mx = max(vals[int(len(vals) * 0.95)] * 1.6, 2.0)  # les pics (rattrapage) sont écrêtés
+        p.setPen(Qt.NoPen)
+        for i, x in enumerate(h):
+            if x["rate"] is None:
+                continue
+            bh = min(x["rate"], mx) / mx * gh
+            p.setBrush(QColor("#ff4d4d") if x["rate"] == 0 else QColor(124, 92, 255, 200))
+            p.drawRect(QRectF(gx + (off + i) * bw, gy + gh - max(bh, 2 if x["rate"] == 0 else 0), max(bw - 1, 1),
+                              max(bh, 2 if x["rate"] == 0 else 0)))
+        pts = [(gx + (off + i + .5) * bw, gy + gh - min(x["tx"], mx) / mx * gh) for i, x in enumerate(h)
+               if x["tx"] is not None]
+        if len(pts) > 1:
+            p.setPen(QColor("#2dd4bf"))
+            for a, b in zip(pts, pts[1:]):
+                p.drawLine(QPointF(*a), QPointF(*b))
+        cmax = max([x["cushion"] or 0 for x in h] + [last.get("target", 20) * 1.4, 10])
+        tgt = last.get("target")
+        if tgt:
+            y = gy + gh - tgt / cmax * gh
+            pen = p.pen()
+            pen.setColor(QColor(255, 210, 80, 110))
+            pen.setStyle(Qt.DashLine)
+            p.setPen(pen)
+            p.drawLine(QPointF(gx, y), QPointF(gx + gw, y))
+        cp = [(gx + (off + i + .5) * bw, gy + gh - min(x["cushion"], cmax) / cmax * gh)
+              for i, x in enumerate(h) if x["cushion"] is not None]
+        if len(cp) > 1:
+            pen = p.pen()
+            pen.setStyle(Qt.SolidLine)
+            pen.setColor(QColor("#ffd250"))
+            pen.setWidthF(2)
+            p.setPen(pen)
+            for a, b in zip(cp, cp[1:]):
+                p.drawLine(QPointF(*a), QPointF(*b))
+        p.setPen(QColor("#8b90a0"))
+        f.setBold(False)
+        f.setPointSizeF(7.5)
+        p.setFont(f)
+        p.drawText(QPointF(gx + 4, gy + 12), f"{num(mx)} Mb/s   ·   2 dernières minutes")
+        p.drawText(QPointF(gx + gw - 40, gy + 12), f"{cmax:.0f} s")
+        # --- état de la lecture (vert = lecture, orange = mémoire tampon, rouge = arrêt)
+        sy = gy + gh + 6
+        p.setPen(Qt.NoPen)
+        for i, x in enumerate(h):
+            p.setBrush(self.COL.get(x["state"], self.COL["-"]))
+            p.drawRect(QRectF(gx + (off + i) * bw, sy, max(bw - 0.5, 1), 8))
+        # --- légende + diagnostic
+        ly = sy + 24
+        f.setPointSizeF(7.5)
+        p.setFont(f)
+        x0 = gx
+        for col, txt in ((QColor(124, 92, 255), "reçu du fournisseur"), (QColor("#2dd4bf"), "envoyé à la TV"),
+                         (QColor("#ffd250"), "réserve (s)"), (QColor("#39d98a"), "lecture"),
+                         (QColor("#ffb020"), "tampon")):
+            p.setPen(Qt.NoPen)
+            p.setBrush(col)
+            p.drawRect(QRectF(x0, ly - 8, 9, 9))
+            p.setPen(QColor("#c8cbd6"))
+            p.drawText(QPointF(x0 + 13, ly), txt)
+            x0 += 13 + p.fontMetrics().horizontalAdvance(txt) + 14
+        txt, col = self.diagnosis()
+        line(self.H - 12, txt, col.name(), True)
+
+
 class ElideLabel(QLabel):
     """Libellé qui raccourcit son texte (…) au lieu d'élargir la fenêtre : titres de chaînes très longs."""
 
@@ -867,6 +1030,10 @@ class RecSession:
         self.resp = None
         self.err = ""
         self.deleted = 0
+        self.samples = deque(maxlen=6000)  # (instant, octets reçus du fournisseur) : graphique de debug
+        self.connects = 0
+        self.reconnects = 0
+        self.served_ms = None   # position (dans l'enregistrement) déjà envoyée au lecteur / à ffmpeg
 
 
 class Relay:
@@ -880,12 +1047,17 @@ class Relay:
         self.hls_proc = self.hls_dir = self.hls_id = None   # conversion ffmpeg pour la Chromecast
         self.active = set()  # connexions amont en cours (libérées à l'arrêt)
         self.rec = None      # enregistrement du flux du fournisseur : la SEULE connexion ouverte
+        self.tx = deque(maxlen=6000)  # (instant, octets) envoyés à la TV
+        self.tv_delay = 20.0          # retard (s) tenu par la TV sur la fin de la liste HLS
+        self.hls_seen = {}            # n° de segment -> durée : durée totale produite (debug)
 
     def ffmpeg_cmd(self, url, v, h, a, outdir):
-        # lecture à vitesse réelle après un démarrage rapide de 16 s : la liste HLS se remplit tout de suite
-        # (le récepteur peut démarrer avec de la réserve), puis l'enregistrement garde son avance sur le direct
+        # pas de cadence imposée : ffmpeg suit l'enregistrement au plus près et la réserve est tenue par la TV
+        # elle-même (elle démarre `tv_delay` s avant la fin de la liste et s'y maintient, voir serve_hls).
+        # Une cadence « temps réel » côté PC dérivait lentement par rapport à l'horloge de la TV : après ~10 min
+        # la TV finissait au ras de la liste et se remettait en mémoire tampon toutes les 20-30 s.
         cmd = [ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-fflags", "+genpts+discardcorrupt",
-               "-readrate", "1", "-readrate_initial_burst", "16", "-i", url, "-map", "0:v:0", "-map", "0:a:0?"]
+               "-i", url, "-map", "0:v:0", "-map", "0:a:0?"]
         if v == "copy":
             cmd += ["-c:v", "copy"]
         else:
@@ -895,7 +1067,7 @@ class Relay:
             if h:
                 cmd += ["-vf", f"scale=-2:{h}"]
         cmd += ["-c:a", "copy"] if a == "copy" else ["-c:a", "aac", "-b:a", "160k", "-ac", "2"]
-        cmd += ["-f", "hls", "-hls_time", "2", "-hls_list_size", "15",
+        cmd += ["-f", "hls", "-hls_time", "2", "-hls_list_size", str(max(15, int(self.tv_delay / 2) + 10)),
                 "-hls_flags", "delete_segments+independent_segments",
                 "-hls_segment_filename", os.path.join(outdir, "seg%05d.ts"), os.path.join(outdir, "index.m3u8")]
         return cmd
@@ -904,6 +1076,7 @@ class Relay:
         """Lance ffmpeg : conversion en HLS compatible Chromecast, servi sous /h/<id>/.
         `url` est le flux local de l'enregistrement : aucune connexion supplémentaire au fournisseur."""
         self.stop_hls()
+        self.hls_seen = {}
         self.hls_dir = tempfile.mkdtemp(prefix="iptvhls_")
         self.hls_id = os.path.basename(self.hls_dir)
         cmd = self.ffmpeg_cmd(url, plan["v"], plan["h"], plan["a"], self.hls_dir)
@@ -937,9 +1110,13 @@ class Relay:
                 r.raise_for_status()
                 sess.resp = r
                 sess.err = ""
+                sess.connects += 1
+                if sess.connects > 1:
+                    sess.reconnects += 1
                 for chunk in r.iter_content(65536):
                     if sess.stop.is_set():
                         break
+                    sess.samples.append((time.time(), len(chunk)))
                     buf += chunk
                     if not synced:  # recale sur les paquets de 188 octets (octet de synchro 0x47)
                         o = next((i for i in range(min(188, len(buf) - 376))
@@ -1085,6 +1262,7 @@ class Relay:
                 self.end_headers()
                 if head:
                     return
+                cum = sum(d for d, _ in list(sess.files)[:idx]) * 1000
                 while relay.rec is sess:
                     files = list(sess.files)
                     if idx >= len(files):
@@ -1099,6 +1277,8 @@ class Relay:
                                 self.wfile.write(b)
                     except FileNotFoundError:
                         pass  # morceau supprimé (hors fenêtre) : on passe au suivant
+                    cum += files[idx][0] * 1000
+                    sess.served_ms = cum
                     idx += 1
 
             def serve_hls(self, name, head, q):
@@ -1113,7 +1293,8 @@ class Relay:
                                 n = fh.read().count("#EXTINF")
                         except OSError:
                             pass
-                        if n >= 6 or (n >= 3 and i >= 40) or (n >= 1 and i >= 100):
+                        need = max(3, int(relay.tv_delay / 2) + 1)  # assez de segments pour démarrer en retrait
+                        if n >= need or (n >= 3 and i >= 60) or (n >= 1 and i >= 100):
                             break
                         time.sleep(0.25)
                 try:
@@ -1125,9 +1306,12 @@ class Relay:
                     self.end_headers()
                     return
                 if name.endswith(".m3u8") and b"#EXT-X-START" not in body:
-                    # le récepteur démarre 14 s avant la fin : réserve contre les à-coups (sinon il lit au ras
-                    # du direct avec 3 segments d'avance et se remet en mémoire tampon sans arrêt)
-                    body = body.replace(b"#EXTM3U", b"#EXTM3U" + bytes([10]) + b"#EXT-X-START:TIME-OFFSET=-14,PRECISE=YES", 1)
+                    # le récepteur démarre `tv_delay` s avant la fin et vise ce retard en continu (HOLD-BACK) :
+                    # c'est sa propre mémoire tampon qui absorbe les à-coups du fournisseur
+                    dly = relay.tv_delay
+                    extra = (f"#EXT-X-START:TIME-OFFSET=-{dly:.0f},PRECISE=YES" + chr(10) +
+                             f"#EXT-X-SERVER-CONTROL:HOLD-BACK={dly:.1f}").encode()
+                    body = body.replace(b"#EXTM3U", b"#EXTM3U" + bytes([10]) + extra, 1)
                 self.send_response(200)
                 self.cors()
                 self.send_header("Content-Type", "application/vnd.apple.mpegurl" if name.endswith(".m3u8")
@@ -1136,6 +1320,8 @@ class Relay:
                 self.end_headers()
                 if not head:
                     self.wfile.write(body)
+                    if name.endswith(".ts"):
+                        relay.tx.append((time.time(), len(body)))  # débit envoyé à la TV (debug)
 
             def serve(self, head=False):
                 try:
@@ -1443,14 +1629,15 @@ class OptionsDialog(QDialog):
         self.sp_ts.setSuffix(" min")
         self.sp_ts.setValue(int(st.get("ts_minutes", 60)))
         self.sp_margin = QSpinBox()
-        self.sp_margin.setRange(3, 60)
+        self.sp_margin.setRange(5, 90)
         self.sp_margin.setSuffix(" s")
         self.sp_margin.setValue(int(st.get("ts_margin", 20)))
-        self.sp_margin.setToolTip("Retard gardé sur le direct. Plus il est grand, moins il y a de saccades "
-                                  "quand le fournisseur envoie les images par à-coups.")
+        self.sp_margin.setToolTip("Décale volontairement le direct (sur le PC en mode Replay et sur la TV) pour "
+                                  "garder une mémoire tampon : les à-coups et coupures courtes du fournisseur "
+                                  "sont absorbés. Sur la TV, 16 s minimum.")
         row_mg = QHBoxLayout()
         row_mg.addSpacing(24)
-        row_mg.addWidget(QLabel("Délai de sécurité anti-saccades"))
+        row_mg.addWidget(QLabel("Retard volontaire sur le direct (mémoire tampon)"))
         row_mg.addWidget(self.sp_margin)
         row_mg.addStretch()
         row_ts = QHBoxLayout()
@@ -1526,6 +1713,8 @@ class Main(QMainWindow):
         self.cast_tok, self.cast_try, self.cast_methods_list = 0, 0, ["direct"]
         self.cast_t0, self.cast_playing, self.cast_sent = None, False, 0.0
         self.cast_purl = ""
+        self.cast_quality = ""
+        self.tvpos_hist = deque(maxlen=20)
         self.relay = Relay()
         clean_stale_temp()
         threading.Thread(target=kill_orphan_ffmpeg, daemon=True).start()
@@ -1545,6 +1734,7 @@ class Main(QMainWindow):
         self.ts_base = 0           # instant d'enregistrement où le lecteur a (ré)ouvert la liste
         self.ts_autolive = False
         self.ts_hist = []
+        self.ts_waiting, self.ts_t0 = False, 0.0
         self.ts_live, self.ts_live_shown, self.ts_rng = True, None, None
         self.ts_timer = QTimer(self)
         self.ts_timer.timeout.connect(self.ts_tick)
@@ -1746,6 +1936,7 @@ class Main(QMainWindow):
         sp.setStretchFactor(1, 1)
         self.setCentralWidget(sp)
 
+        self.debug = DebugOverlay(self)
         self.build_menus()
         self.devices = QMediaDevices(self)
         self.devices.audioOutputsChanged.connect(self.fill_audio_menu)
@@ -1767,6 +1958,95 @@ class Main(QMainWindow):
                 if secret and len(secret) > 2:
                     text = str(text).replace(secret, "•••")
         return text
+
+    def toggle_debug(self):
+        if self.debug.isVisible():
+            self.debug.stop()
+            self.act_debug.setChecked(False)
+        else:
+            self.debug.start()
+            self.act_debug.setChecked(True)
+
+    def moveEvent(self, e):
+        super().moveEvent(e)
+        if getattr(self, "debug", None) is not None and self.debug.isVisible():
+            self.debug.reposition()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if getattr(self, "debug", None) is not None and self.debug.isVisible():
+            self.debug.reposition()
+
+    def debug_sample(self):
+        """Mesures d'une seconde pour l'overlay de debug."""
+        now = time.time()
+        sess = self.relay.rec
+        d = dict(rate=None, tx=None, cushion=None, gap=None, state="-", reconnects=0, err="",
+                 target=max(16, self.ts_margin / 1000) if self.cast else self.ts_margin / 1000,
+                 quality=self.cast_quality if self.cast else self.q_info.text(),
+                 mode="TV" if self.cast else ("Replay" if self.ts_active else ("Direct" if self.cands else "—")))
+        if sess is not None:
+            smp = [x for x in list(sess.samples) if x[0] > now - 120]
+            d["rate"] = sum(n for t, n in smp if t > now - 1) * 8 / 1e6
+            ts = [t for t, _ in smp] + [now]
+            d["gap"] = max((b - a for a, b in zip(ts, ts[1:])), default=0)
+            d["reconnects"], d["err"] = sess.reconnects, sess.err
+            hi = sum(x for x, _ in list(sess.files)) * 1000
+            if self.ts_active:
+                d["cushion"] = max(0, (hi - self.rec_pos()) / 1000)
+            elif self.cast and sess.served_ms is not None:
+                d["cushion"] = self.tv_buffer()  # avance de la liste HLS sur la position de lecture de la TV
+        if self.cast:
+            d["tx"] = sum(n for t, n in list(self.relay.tx) if t > now - 1) * 8 / 1e6
+            try:
+                st = self.cast.media_controller.status
+                state = {"PLAYING": "P", "BUFFERING": "B", "IDLE": "I", "PAUSED": "Z"}.get(
+                    st.player_state if st else "", "-")
+                pos = st.adjusted_current_time if st else None
+                if pos is not None:
+                    self.tvpos_hist.append((now, pos))
+                if state in ("P", "B"):
+                    # certains récepteurs (AirScreen) annoncent « mémoire tampon » alors que la vidéo avance :
+                    # on juge sur la progression réelle de la lecture (sur 4 s, positions envoyées toutes les ~3 s)
+                    old = [x for x in self.tvpos_hist if now - x[0] >= 4]
+                    if old:
+                        t1, p1 = old[-1]
+                        state = "P" if (pos or 0) - p1 >= 0.5 * (now - t1) else "B"
+                d["state"] = state
+            except Exception:
+                pass
+        elif self.cands:
+            ms, ps = self.player.mediaStatus(), self.player.playbackState()
+            if ms in (QMediaPlayer.BufferingMedia, QMediaPlayer.StalledMedia, QMediaPlayer.LoadingMedia):
+                d["state"] = "B"
+            elif ps == QMediaPlayer.PlayingState:
+                d["state"] = "P"
+            elif ps == QMediaPlayer.PausedState:
+                d["state"] = "Z"
+            elif ms == QMediaPlayer.InvalidMedia:
+                d["state"] = "I"
+        return d
+
+    def tv_buffer(self):
+        """Réserve réelle de la TV : durée totale produite dans la liste HLS - position de lecture de la TV."""
+        r = self.relay
+        if not r.hls_dir:
+            return None
+        try:
+            with open(os.path.join(r.hls_dir, "index.m3u8"), encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+            seq = next(int(x.split(":")[1]) for x in lines if x.startswith("#EXT-X-MEDIA-SEQUENCE"))
+            for x in lines:
+                if x.startswith("#EXTINF:"):
+                    r.hls_seen[seq] = float(x[8:].split(",")[0])
+                    seq += 1
+            st = self.cast.media_controller.status if self.cast else None
+            pos = st.adjusted_current_time if st else None
+            if pos is None:
+                return None
+            return max(0.0, sum(r.hls_seen.values()) - pos)
+        except Exception:
+            return None
 
     def make_tree(self, cls=QTreeWidget):
         t = cls()
@@ -1836,6 +2116,9 @@ class Main(QMainWindow):
         self.act_semi = self.act(m, "Mode semi plein écran", self.toggle_semi, "F", checkable=True)
         self.act(m, "Plein écran", lambda: self.video.setFullScreen(True), "F11")
         self.act(m, "Quitter le semi plein écran", self.exit_semi, "Esc")
+        m.addSeparator()
+        self.act_debug = self.act(m, "Debug du flux (graphique sur la vidéo)", self.toggle_debug, "Ctrl+Shift+D",
+                                  checkable=True)
         m = mb.addMenu("&Options")
         self.act(m, "Paramètres…", lambda: OptionsDialog(self).exec(), "Ctrl+,")
         self.act(m, "Mises à jour…", lambda: UpdateDialog(self).exec())
@@ -2611,7 +2894,7 @@ class Main(QMainWindow):
             old = self.cast
             if old is not None:
                 self.cast_release(old)
-            self.player.stop()
+            self.release_player()
             self.end_timeshift(keep_rec=True)  # l'enregistrement reste la seule connexion et alimente la TV
             self.cast = c
             c.media_controller.register_status_listener(CastListener(self.cast_event))
@@ -2710,16 +2993,33 @@ class Main(QMainWindow):
             else:
                 base = self.relay.start_timeshift(src)  # réutilise l'enregistrement si c'est la même chaîne
                 sess = self.relay.rec
-                for _ in range(180):  # au moins 2 morceaux ; le fournisseur peut mettre ~30 s à libérer l'ancienne chaîne
+                # retard volontaire sur le direct : la TV lit `delay` s en arrière. ~14 s sont mis d'avance dans sa
+                # liste de lecture, le reste reste en réserve dans l'enregistrement (coupures du fournisseur absorbées)
+                delay = max(16, int(load_settings().get("ts_margin", 20)))
+                t_wait = time.time()
+                while True:  # le fournisseur peut mettre ~30 s à libérer l'ancienne chaîne
                     if tok != self.cast_tok:
                         return "stale"
-                    if len(sess.files) >= 2:
+                    files = list(sess.files)
+                    have = sum(d for d, _ in files)
+                    waited = time.time() - t_wait
+                    if len(files) >= 2 and (have >= delay or waited > delay + 15):
+                        break
+                    if waited > 45 + delay or (not files and waited > 45):
                         break
                     time.sleep(0.25)
-                if len(sess.files) < 2:
+                files = list(sess.files)
+                if len(files) < 2:
                     raise SourceDown("flux indisponible : " + (sess.err or "aucune donnée reçue"))
-                local = f"{base}/c.ts?s={max(0, len(sess.files) - 8)}"
+                idx, back = len(files), 0.0
+                while idx > 0 and back < delay:
+                    idx -= 1
+                    back += files[idx][0]
+                local = f"{base}/c.ts?s={idx}"
+                self.relay.tv_delay = float(delay)
                 info = probe_cached(src, local)
+                if info:
+                    self.cast_quality = f"{info['h']}p  ·  {round(info['fps'])} i/s  ·  {info['vcodec']}"
                 if tok != self.cast_tok:
                     return "stale"
                 purl = self.relay.transcode_url(local, c.cast_info.host, build_plan(info, method))
@@ -2910,6 +3210,7 @@ class Main(QMainWindow):
             src = url0[:-5] + ".ts" if url0.endswith(".m3u8") else url0
             self.ts_window_ms = int(st.get("ts_minutes", 60)) * 60000
             self.ts_margin = int(st.get("ts_margin", 20)) * 1000
+            self.release_player()  # libère d'abord une éventuelle connexion directe du lecteur
             self.ts_url, self.ts_pending = self.relay.start_timeshift(src), None
             self.ts_base = 0
             self.ts_autolive = True
@@ -2919,7 +3220,10 @@ class Main(QMainWindow):
             self.b_live.setVisible(True)
             self.seek.setEnabled(False)
             self.ts_timer.start(1000)
-            self.ts_open(0)
+            # la lecture démarre quand l'enregistrement a pris le retard voulu (mémoire tampon) ;
+            # souvent immédiat : les fournisseurs envoient d'abord plusieurs secondes d'avance
+            self.ts_waiting, self.ts_t0 = True, time.time()
+            self.set_ts_label(self.t_cur, "tampon…")
             return
         self.q_info.setText("")
         self.end_timeshift()
@@ -2991,6 +3295,12 @@ class Main(QMainWindow):
                 self.relay.stop_rec()
             self.on_dur(0)
 
+    def release_player(self):
+        """Arrête le lecteur ET ferme sa source : stop() seul garde la connexion au fournisseur ouverte,
+        ce qui bloque toute nouvelle connexion avec un abonnement limité à 1."""
+        self.player.stop()
+        self.player.setSource(QUrl())
+
     def rec_pos(self):
         """Position dans l'enregistrement (la position du lecteur est relative au point d'ouverture)."""
         return self.ts_base + self.player.position()
@@ -3017,6 +3327,14 @@ class Main(QMainWindow):
             return
         segs = self.relay.ts_segments()
         hi = int(sum(d for d, _ in segs) * 1000)
+        if self.ts_waiting:
+            waited = time.time() - self.ts_t0
+            if hi > 0 and (hi >= self.ts_margin or waited > self.ts_margin / 1000 + 5):
+                self.ts_waiting = False
+                self.ts_open(max(0, hi - self.ts_margin))
+            else:
+                self.set_ts_label(self.t_cur, f"tampon {hi // 1000}/{self.ts_margin // 1000} s")
+            return
         if hi <= 0:
             return
         lo = max(0, hi - self.ts_window_ms)
@@ -3028,7 +3346,8 @@ class Main(QMainWindow):
             n = len(self.ts_hist)
             if (n >= 6 and hi - self.ts_hist[-5] <= 8000) or n >= 25:
                 self.ts_autolive = False
-                return self.ts_seek(hi - self.ts_margin)
+                if hi - self.rec_pos() > self.ts_margin + 8000:  # l'arriéré a creusé le retard : on le ramène
+                    return self.ts_seek(hi - self.ts_margin)
         pos = self.rec_pos()
         if pos < lo - 1500 and self.player.playbackState() != QMediaPlayer.StoppedState:
             self.ts_seek(lo + 2000)  # on a dépassé la fenêtre conservée
@@ -3116,7 +3435,7 @@ class Main(QMainWindow):
                 self.cast.media_controller.stop()
             except Exception:
                 pass
-        self.player.stop()
+        self.release_player()
         self.end_timeshift()
 
     def seek_to(self, ms):

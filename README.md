@@ -51,7 +51,7 @@
 ### ⏺ Replay (direct différé)
 - **Pause, retour arrière et retour au direct** sur les chaînes en direct
 - Le flux est enregistré tel quel sur le disque (aucune conversion, même qualité qu'en direct)
-- Durée gardée en mémoire et délai de sécurité anti-saccades réglables
+- Durée gardée en mémoire et **retard volontaire sur le direct** (mémoire tampon) réglables
 - Bouton **⏺ Replay** sous le lecteur pour l'activer ou le couper à tout moment
 
 ### Guide des programmes
@@ -63,6 +63,12 @@
 - Chromecast, Google TV / Android TV et **Fire TV** (avec l'application AirScreen)
 - Conversion automatique quand la télé ne sait pas lire un flux, et plusieurs méthodes essayées tour à tour si rien ne démarre
 - **Une seule connexion au fournisseur**, même pendant la diffusion : compatible avec les abonnements limités à 1 connexion
+- La télé garde elle-même un retard de 20 s (réglable) sur le direct pour absorber les à-coups du fournisseur
+
+### 🩺 Debug du flux
+- `Ctrl+Maj+D` : panneau transparent sur la vidéo avec le graphique des 2 dernières minutes (réception du fournisseur, envoi à la télé, réserve, état de lecture) et un diagnostic : coupure du fournisseur ou problème côté télé / Wi-Fi
+
+![Debug du flux](docs/debug_overlay.png)
 
 ### Comptes et mises à jour
 - Plusieurs comptes Xtream, connexion automatique au dernier utilisé
@@ -125,6 +131,7 @@ Au premier envoi, Windows peut demander d'autoriser KFluxTV dans le pare-feu : a
 | `F11` | Plein écran |
 | `Échap` | Quitter le plein écran / semi plein écran |
 | `Ctrl+D` | Ajouter / retirer des favoris |
+| `Ctrl+Maj+D` | Debug du flux (graphique sur la vidéo) |
 | `Ctrl+E` / `Ctrl+Maj+E` | Tout développer / tout réduire |
 | `Ctrl+P` | Gérer les comptes |
 | `F5` | Recharger les listes |
@@ -141,7 +148,8 @@ Menu **Options → Paramètres…**
 
 - Connexion automatique au dernier compte au démarrage
 - Recherche des mises à jour au démarrage
-- **Direct différé** (Replay) : activation, durée gardée en mémoire (60 min par défaut), délai de sécurité anti-saccades (20 s par défaut)
+- **Direct différé** (Replay) : activation, durée gardée en mémoire (60 min par défaut)
+- **Retard volontaire sur le direct** (mémoire tampon, 20 s par défaut) : utilisé par le Replay et par la diffusion sur la télé (16 s minimum)
 - Accès au dossier des données
 
 Menu **Diffusion → Compatibilité TV** : conversion automatique (recommandé), toujours convertir, ou jamais.
@@ -154,7 +162,7 @@ Menu **Diffusion → Compatibilité TV** : conversion automatique (recommandé),
 Ton abonnement n'autorise qu'un nombre limité de connexions simultanées et elles sont déjà utilisées : un autre appareil regarde avec le même compte, ou le fournisseur n'a pas encore libéré la chaîne précédente. Ferme les autres lecteurs et réessaie après quelques secondes. *Compte → Informations du compte* affiche les connexions utilisées.
 
 **L'image saccade**
-Les fournisseurs envoient souvent les images par à-coups. Garde le **Replay** activé et augmente le *délai de sécurité anti-saccades* dans les Options (30 s par exemple). Sans Replay, l'application lit le flux direct.
+Les fournisseurs envoient souvent les images par à-coups. Ouvre le **Debug du flux** (`Ctrl+Maj+D`) : il indique si les arrêts viennent du fournisseur ou de la télé / du Wi-Fi. Garde le **Replay** activé et augmente le *retard volontaire sur le direct* dans les Options (30 s par exemple).
 
 **Une chaîne « FHD » paraît floue**
 Regarde la qualité affichée sous le lecteur : certains fournisseurs nomment « FHD » des chaînes envoyées en 720p à faible débit. L'application ne peut pas faire mieux que la source ; essaie une autre version de la chaîne (HD, 4K…).
